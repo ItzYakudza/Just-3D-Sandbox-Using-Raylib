@@ -1256,6 +1256,17 @@ inline SupportType GetSupportType(BlockId b) {
 
 inline bool IsFluidBlock(BlockId b) { return b == g_WaterId || b == g_LavaId; }
 
+inline bool IsReplaceableByFluid(BlockId b) {
+	if (b == INVALID_BLOCK_ID || b >= g_blocks.Count() || b == g_AirId)
+		return false;
+	if (IsFluidBlock(b))
+		return false;
+	if (IsCross(b))
+		return true;
+	SupportType s = GetSupportType(b);
+	return s == SupportType::Floor || s == SupportType::WallSide || s == SupportType::Ceiling;
+}
+
 struct KnownBlockIds {
 	BlockId stone, dirt, grass, sand, shortGrass, dandelion, poppy, anvil, oakLog, oakLeaves, torch;
 } g_known;
@@ -1318,7 +1329,7 @@ void ConfigureBlockSupportTypes()
 			n.find("wall_torch") != std::string::npos || n.find("wall_sign") != std::string::npos ||
 			n.find("wall_banner") != std::string::npos || n.find("wall_hanging_sign") != std::string::npos ||
 			n.find("wall_skull") != std::string::npos || n.find("wall_head") != std::string::npos ||
-			n.find("wall_" ) == 0 || n.find("ladder") != std::string::npos ||
+			n.find("wall_") == 0 || n.find("ladder") != std::string::npos ||
 			n.find("lever") != std::string::npos || n.find("tripwire_hook") != std::string::npos ||
 			n.find("vine") != std::string::npos;
 
@@ -1329,6 +1340,7 @@ void ConfigureBlockSupportTypes()
 		if (ceilingAttached) def.support = SupportType::Ceiling;
 		else if (wallAttached) def.support = SupportType::WallSide;
 		else if (floorAttached) def.support = SupportType::Floor;
+		else if (def.isCross) def.support = SupportType::Floor;   // ← добавлено
 	}
 }
 
@@ -2591,8 +2603,9 @@ void ProcessFluidCell(std::unordered_map<int64_t, Chunk>& chunks, int x, int y, 
 	int maxLevel = MaxFluidLevel(fluidType);
 	int computedLevel = fedFromAbove ? maxLevel : (bestNeighborLevel - 1);
 
-	if (current == g_AirId) {
-		if (computedLevel <= 0) return; // нечему сюда течь
+	// воздух ИЛИ заменимый блок (цветы, трава, факелы и т.п.)
+	if (current == g_AirId || IsReplaceableByFluid(current)) {
+		if (computedLevel <= 0) return;
 		chunk.Set(lx, y, lz, fluidType);
 		chunk.fluidLevels[Chunk::LightIndex(lx, y, lz)] = (uint8_t)(computedLevel & 0x0F) | (fedFromAbove ? 0x10 : 0);
 		DirtyChunksAroundBlock(chunks, x, y, z, 2, true);
@@ -2601,7 +2614,7 @@ void ProcessFluidCell(std::unordered_map<int64_t, Chunk>& chunks, int x, int y, 
 		return;
 	}
 
-	if (current != fluidType) return; // тут теперь что-то другое — нечего обновлять
+	if (current != fluidType) return;
 
 	auto flIt = chunk.fluidLevels.find(Chunk::LightIndex(lx, y, lz));
 	bool hasExplicit = (flIt != chunk.fluidLevels.end());
