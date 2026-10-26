@@ -318,8 +318,23 @@ struct Chunk {
 	Layer* layers = nullptr;
 	BlockId* dense = nullptr;
 	std::unordered_map<int, uint8_t> fluidLevels;
+	// Sparse per-cell block properties (e.g. facing=north). Key = LightIndex.
+	std::unordered_map<int, std::map<std::string, std::string>> blockStates;
 
 	static int LightIndex(int x, int y, int z) { return (x * WORLD_HEIGHT + y) * CHUNK_SIZE + z; }
+
+	void ClearBlockState(int x, int y, int z) {
+		blockStates.erase(LightIndex(x, y, z));
+	}
+	void SetBlockState(int x, int y, int z, std::map<std::string, std::string> state) {
+		if (state.empty()) blockStates.erase(LightIndex(x, y, z));
+		else blockStates[LightIndex(x, y, z)] = std::move(state);
+	}
+	std::map<std::string, std::string> GetBlockState(int x, int y, int z) const {
+		auto it = blockStates.find(LightIndex(x, y, z));
+		if (it != blockStates.end()) return it->second;
+		return {};
+	}
 
 	void EnsureLightAllocated() {
 		const int N = CHUNK_SIZE * WORLD_HEIGHT * CHUNK_SIZE;
@@ -372,6 +387,10 @@ struct Chunk {
 		dense[(x * WORLD_HEIGHT + y) * CHUNK_SIZE + z] = type;
 
 		if (old != type) {
+			ClearBlockState(x, y, z);
+			// Drop fluid level when the cell is no longer that fluid (source covered / evaporated).
+			if (old == g_WaterId || old == g_LavaId)
+				fluidLevels.erase(LightIndex(x, y, z));
 			Vector3 wp{
 				(float)(chunkX * CHUNK_SIZE + x) + 0.5f,
 				(float)y + 0.5f,
@@ -450,6 +469,7 @@ struct Chunk {
 		hasMesh = other.hasMesh; hasWaterMesh = other.hasWaterMesh;
 		lightSourcePositions = std::move(other.lightSourcePositions);
 		fluidLevels = std::move(other.fluidLevels);
+		blockStates = std::move(other.blockStates);
 		skyLight = other.skyLight; blockLight = other.blockLight;
 		mode = other.mode; singleBlock = other.singleBlock;
 		layers = other.layers; dense = other.dense;
@@ -468,6 +488,7 @@ struct Chunk {
 			hasMesh = other.hasMesh; hasWaterMesh = other.hasWaterMesh;
 			lightSourcePositions = std::move(other.lightSourcePositions);
 			fluidLevels = std::move(other.fluidLevels);
+			blockStates = std::move(other.blockStates);
 			skyLight = other.skyLight; blockLight = other.blockLight;
 			mode = other.mode; singleBlock = other.singleBlock;
 			layers = other.layers; dense = other.dense;
@@ -535,6 +556,187 @@ Texture2D GetOrLoadTexture(std::map<std::string, Texture2D>& cache, const std::s
 	cache[textureId] = tex;
 	return tex;
 }
+
+// ---------------------------------------------------------------------------
+// Texture atlas: pack loaded PNGs into one/few pages for fewer draw calls.
+// Does NOT replace source textures — only remaps UVs at mesh build time.
+// Lighting stays in vertex color; atlas only affects sampling.
+// ---------------------------------------------------------------------------
+struct TextureAtlas {
+	static constexpr int kPageSize = 2048;
+	static constexpr int kPad = 1;
+
+	struct Entry {
+		int page = 0;
+		float u0 = 0, v0 = 0, u1 = 1, v1 = 1; // inner rect in page UV space
+	};
+
+	std::vector<Texture2D> pages;
+	std::unordered_map<unsigned int, Entry> byId; // Texture2D.id → entry
+
+	bool Has(unsigned int texId) const { return byId.find(texId) != byId.end(); }
+
+	Vector2 MapUV(unsigned int texId, Vector2 uv) const {
+		auto it = byId.find(texId);
+		if (it == byId.end()) return uv;
+		const Entry& e = it->second;
+		return {
+			e.u0 + uv.x * (e.u1 - e.u0),
+			e.v0 + uv.y * (e.v1 - e.v0)
+		};
+	}
+
+	Texture2D PageTexture(int page) const {
+		if (page < 0 || page >= (int)pages.size()) return Texture2D{};
+		return pages[page];
+	}
+
+	int PageOf(unsigned int texId) const {
+		auto it = byId.find(texId);
+		return it == byId.end() ? -1 : it->second.page;
+	}
+
+	void Unload() {
+		for (auto& p : pages) if (p.id != 0) UnloadTexture(p);
+		pages.clear();
+		byId.clear();
+	}
+
+	// Shelf-pack every unique texture from the cache into atlas pages.
+	void BuildFromCache(const std::map<std::string, Texture2D>& cache) {
+		Unload();
+
+		// Unique by GPU texture id
+		std::vector<Texture2D> list;
+		std::unordered_set<unsigned int> seen;
+		for (const auto& [_, tex] : cache) {
+			if (tex.id == 0 || tex.width <= 0 || tex.height <= 0) continue;
+			if (!seen.insert(tex.id).second) continue;
+			list.push_back(tex);
+		}
+		// Larger first → denser pack
+		std::sort(list.begin(), list.end(), [](const Texture2D& a, const Texture2D& b) {
+			return (a.height != b.height) ? (a.height > b.height) : (a.width > b.width);
+			});
+
+		struct Shelf { int y, h, x; };
+		std::vector<Shelf> shelves;
+		Image pageImg = GenImageColor(kPageSize, kPageSize, BLANK);
+		int pageIndex = 0;
+
+		auto flushPage = [&]() {
+			if (byId.empty() && pages.empty()) {
+				// still create page only if something was drawn — tracked below
+			}
+			Texture2D page = LoadTextureFromImage(pageImg);
+			SetTextureFilter(page, TEXTURE_FILTER_POINT);
+			SetTextureWrap(page, TEXTURE_WRAP_CLAMP);
+			pages.push_back(page);
+			UnloadImage(pageImg);
+			pageImg = GenImageColor(kPageSize, kPageSize, BLANK);
+			shelves.clear();
+			pageIndex = (int)pages.size();
+			};
+
+		// We'll assign pageIndex as pages.size() while drawing into current image
+		pageIndex = 0;
+
+		for (const Texture2D& tex : list) {
+			const int tw = tex.width;
+			const int th = tex.height;
+			const int bw = tw + kPad * 2;
+			const int bh = th + kPad * 2;
+			if (bw > kPageSize || bh > kPageSize) {
+				TraceLog(LOG_WARNING, "Atlas: texture %u (%dx%d) larger than page, skipped",
+					tex.id, tw, th);
+				continue;
+			}
+
+			// Find shelf
+			int placeX = -1, placeY = -1;
+			for (auto& s : shelves) {
+				if (s.h >= bh && s.x + bw <= kPageSize) {
+					placeX = s.x;
+					placeY = s.y;
+					s.x += bw;
+					break;
+				}
+			}
+			if (placeX < 0) {
+				int y = 0;
+				if (!shelves.empty())
+					y = shelves.back().y + shelves.back().h;
+				if (y + bh > kPageSize) {
+					// flush current page
+					Texture2D page = LoadTextureFromImage(pageImg);
+					SetTextureFilter(page, TEXTURE_FILTER_POINT);
+					SetTextureWrap(page, TEXTURE_WRAP_CLAMP);
+					pages.push_back(page);
+					UnloadImage(pageImg);
+					pageImg = GenImageColor(kPageSize, kPageSize, BLANK);
+					shelves.clear();
+					pageIndex = (int)pages.size();
+					y = 0;
+				}
+				shelves.push_back({ y, bh, bw });
+				placeX = 0;
+				placeY = y;
+			}
+
+			Image src = LoadImageFromTexture(tex);
+			// Draw with 1px padding: fill pad by clamping edge pixels via ImageDraw
+			const int dx = placeX + kPad;
+			const int dy = placeY + kPad;
+			ImageDraw(&pageImg, src,
+				Rectangle{ 0, 0, (float)tw, (float)th },
+				Rectangle{ (float)dx, (float)dy, (float)tw, (float)th },
+				WHITE);
+			// Simple edge pad (copy border)
+			if (kPad > 0) {
+				// top / bottom rows
+				ImageDraw(&pageImg, src,
+					Rectangle{ 0, 0, (float)tw, 1 },
+					Rectangle{ (float)dx, (float)(dy - 1), (float)tw, 1 }, WHITE);
+				ImageDraw(&pageImg, src,
+					Rectangle{ 0, (float)(th - 1), (float)tw, 1 },
+					Rectangle{ (float)dx, (float)(dy + th), (float)tw, 1 }, WHITE);
+				// left / right cols
+				ImageDraw(&pageImg, src,
+					Rectangle{ 0, 0, 1, (float)th },
+					Rectangle{ (float)(dx - 1), (float)dy, 1, (float)th }, WHITE);
+				ImageDraw(&pageImg, src,
+					Rectangle{ (float)(tw - 1), 0, 1, (float)th },
+					Rectangle{ (float)(dx + tw), (float)dy, 1, (float)th }, WHITE);
+			}
+			UnloadImage(src);
+
+			Entry e;
+			e.page = pageIndex;
+			e.u0 = (float)dx / (float)kPageSize;
+			e.v0 = (float)dy / (float)kPageSize;
+			e.u1 = (float)(dx + tw) / (float)kPageSize;
+			e.v1 = (float)(dy + th) / (float)kPageSize;
+			byId[tex.id] = e;
+		}
+
+		// Final page
+		bool anyDrawn = false;
+		for (const auto& kv : byId)
+			if (kv.second.page == pageIndex) { anyDrawn = true; break; }
+		if (anyDrawn || pages.empty()) {
+			Texture2D page = LoadTextureFromImage(pageImg);
+			SetTextureFilter(page, TEXTURE_FILTER_POINT);
+			SetTextureWrap(page, TEXTURE_WRAP_CLAMP);
+			pages.push_back(page);
+		}
+		UnloadImage(pageImg);
+
+		TraceLog(LOG_INFO, "Texture atlas: %d textures → %d page(s) %dx%d",
+			(int)byId.size(), (int)pages.size(), kPageSize, kPageSize);
+	}
+};
+
+TextureAtlas g_atlas;
 
 nlohmann::json LoadRawJson(const std::string& path) {
 	std::ifstream file(path);
@@ -793,6 +995,8 @@ struct BlockStateData {
 struct BlockDef {
 	BlockId id = INVALID_BLOCK_ID;
 	std::string name;
+	// Optional texture id used when no blockstate/model exists (prototype blocks)
+	std::string fallbackTexture;
 	std::vector<BlockPropertyDef> properties;
 	std::map<std::string, std::string> defaultState;
 	BlockStateData stateData;
@@ -1081,10 +1285,25 @@ static uint8_t KnownLightEmission(const std::string& name) {
 	return it == table.end() ? 0 : it->second;
 }
 
+
+static std::string SerializeState(const std::map<std::string, std::string>& state) {
+	if (state.empty()) return "";
+	std::string r;
+	for (const auto& [k, v] : state) {
+		if (!r.empty()) r += ',';
+		r += k;
+		r += '=';
+		r += v;
+	}
+	return r;
+}
+
 class BlockRegistry {
 public:
 	std::vector<BlockDef> defs; // index == BlockId (индекс 0 зарезервирован/пуст)
 	std::unordered_map<std::string, BlockId> nameToId;
+	// Names explicitly registered via RegisterBlock (stable gameplay contract)
+	std::unordered_set<std::string> registeredNames;
 
 	BlockId Resolve(const std::string& name) const {
 		auto it = nameToId.find(name);
@@ -1094,9 +1313,73 @@ public:
 	const BlockDef& Get(BlockId id) const { return defs[id]; }
 	size_t Count() const { return defs.size(); }
 
+	// Explicit registration: assigns a stable id and marks the name as known to the game.
+	// Appearance still comes from blockstates/models (loaded later in LoadAll).
+	// Optional texturePath is only used as a fallback cube when no blockstate exists.
+	BlockId Register(const std::string& name, const char* fallbackTexture = nullptr) {
+		if (name.empty()) return INVALID_BLOCK_ID;
+		auto it = nameToId.find(name);
+		if (it != nameToId.end()) {
+			registeredNames.insert(name);
+			return it->second;
+		}
+		if (defs.empty()) {
+			defs.push_back(BlockDef{}); // reserve id 0
+		}
+		BlockDef def;
+		def.name = name;
+		if (fallbackTexture && fallbackTexture[0])
+			def.fallbackTexture = fallbackTexture;
+		BlockId id = (BlockId)defs.size();
+		def.id = id;
+		nameToId[name] = id;
+		nameToId["minecraft:" + name] = id;
+		registeredNames.insert(name);
+		defs.push_back(std::move(def));
+		return id;
+	}
+
+	// Core gameplay blocks — registered first so ids stay stable across runs.
+	void RegisterGameplayBlocks() {
+		// Fluids / world
+		Register("air");
+		Register("bedrock");
+		Register("water");
+		Register("lava");
+		// Terrain
+		Register("stone");
+		Register("dirt");
+		Register("grass_block");
+		Register("sand");
+		Register("red_sand");
+		Register("gravel");
+		Register("cobblestone");
+		Register("obsidian");
+		// Plants / decoration
+		Register("short_grass");
+		Register("dandelion");
+		Register("poppy");
+		Register("oak_log");
+		Register("oak_leaves");
+		Register("torch");
+		Register("wall_torch");
+		Register("anvil");
+	}
+
 	void LoadAll(const std::string& blockstatesDir, std::map<std::string, Texture2D>& textureCache) {
-		defs.clear(); nameToId.clear();
-		defs.push_back(BlockDef{}); // id 0 — пустой слот (настоящий "air" получит свой реальный id ниже)
+		// Keep explicit registrations; only clear auto-scanned extras if starting fresh
+		if (defs.empty()) {
+			defs.push_back(BlockDef{});
+		}
+		if (registeredNames.empty())
+			RegisterGameplayBlocks();
+
+		// Index existing defs by name for in-place fill
+		auto findDef = [&](const std::string& name) -> BlockDef* {
+			auto it = nameToId.find(name);
+			if (it == nameToId.end() || it->second >= defs.size()) return nullptr;
+			return &defs[it->second];
+			};
 
 		for (auto& entry : fs::directory_iterator(blockstatesDir)) {
 			if (entry.path().extension() != ".json") continue;
@@ -1105,8 +1388,20 @@ public:
 			std::ifstream f(entry.path());
 			nlohmann::json j; f >> j;
 
-			BlockDef def;
-			def.name = name;
+			BlockDef* pdef = findDef(name);
+			if (!pdef) {
+				// Auto-register anything found on disk (data-driven extras)
+				Register(name);
+				pdef = findDef(name);
+			}
+			if (!pdef) continue;
+			BlockDef& def = *pdef;
+			// Reset appearance data; keep id/name/fallback
+			def.properties.clear();
+			def.defaultState.clear();
+			def.stateData = BlockStateData{};
+			def.modelCache.clear();
+			def.shapeCache.clear();
 
 			auto registerProp = [&](const std::string& pk, const std::string& pv) {
 				auto pit = std::find_if(def.properties.begin(), def.properties.end(),
@@ -1170,17 +1465,44 @@ public:
 			else continue;
 
 			for (auto& p : def.properties) def.defaultState[p.name] = PreferredDefaultFor(p.name, p.values);
-
-			BlockId id = (BlockId)defs.size();
-			def.id = id;
-			nameToId[def.name] = id;
-			nameToId["minecraft:" + def.name] = id;
-			defs.push_back(std::move(def));
+			// id / nameToId already assigned by Register()
 		}
 
+		// Build models for every known block (registered + auto-scanned)
 		for (BlockDef& def : defs) {
 			if (def.name.empty()) continue;
-			BlockModel model = BuildStateModel(def, def.defaultState, textureCache);
+
+			BlockModel model;
+			const bool hasAppearance =
+				!def.stateData.variants.empty() || !def.stateData.multipart.empty();
+			if (hasAppearance) {
+				model = BuildStateModel(def, def.defaultState, textureCache);
+			}
+			else {
+				// Fallback cube for RegisterBlock("x", "block/x") without blockstate
+				std::string texId = def.fallbackTexture.empty()
+					? ("minecraft:block/" + def.name)
+					: def.fallbackTexture;
+				if (texId.rfind("minecraft:", 0) != 0 && texId.find(':') == std::string::npos)
+					texId = "minecraft:" + texId;
+				Texture2D tex = GetOrLoadTexture(textureCache, texId);
+				model.isFullCube = true;
+				const char* faces[6] = { "down","up","north","south","west","east" };
+				for (int fi = 0; fi < 6; fi++) {
+					LocalQuad q{};
+					ElementFaceGeom geom;
+					GetElementFaceGeom(faces[fi], { 0,0,0 }, { 1,1,1 }, geom);
+					for (int i = 0; i < 4; i++) {
+						q.v[i] = geom.v[i];
+						q.uv[i] = geom.uvUnit[i];
+					}
+					q.normal = geom.normal;
+					q.texture = tex;
+					q.hasOwnTexture = true;
+					model.quads.push_back(q);
+				}
+			}
+
 			def.isFullCube = model.isFullCube;
 
 			bool transparent = false;
@@ -1215,6 +1537,18 @@ public:
 
 			def.modelCache[""] = std::move(model);
 			def.shapeCache[""] = BuildStateVoxelShape(def, def.defaultState);
+
+			// Pre-build oriented variants (wall_torch facing=..., stairs, etc.)
+			if (!def.stateData.isMultipart) {
+				for (const auto& [cond, ref] : def.stateData.variants) {
+					std::map<std::string, std::string> st = def.defaultState;
+					for (const auto& [k, v] : cond) st[k] = v;
+					const std::string key = SerializeState(st);
+					if (def.modelCache.count(key)) continue;
+					def.modelCache[key] = BuildStateModel(def, st, textureCache);
+					def.shapeCache[key] = BuildStateVoxelShape(def, st);
+				}
+			}
 		}
 
 		g_AirId = Resolve("air");
@@ -1229,6 +1563,12 @@ public:
 BlockRegistry g_blocks;
 BlockId g_AirId = INVALID_BLOCK_ID, g_WaterId = INVALID_BLOCK_ID,
 g_LavaId = INVALID_BLOCK_ID, g_BedrockId = INVALID_BLOCK_ID;
+
+// Public registration helper: name is the gameplay id; optional texture is only a
+// fallback cube when no blockstate/model is present under resources/.
+inline BlockId RegisterBlock(const char* name, const char* fallbackTexture = nullptr) {
+	return g_blocks.Register(name ? name : "", fallbackTexture);
+}
 
 uint8_t GetBlockLightEmission(BlockId id)
 {
@@ -1257,18 +1597,28 @@ inline SupportType GetSupportType(BlockId b) {
 inline bool IsFluidBlock(BlockId b) { return b == g_WaterId || b == g_LavaId; }
 
 inline bool IsReplaceableByFluid(BlockId b) {
-	if (b == INVALID_BLOCK_ID || b >= g_blocks.Count() || b == g_AirId)
-		return false;
-	if (IsFluidBlock(b))
-		return false;
-	if (IsCross(b))
-		return true;
+	if (b == INVALID_BLOCK_ID || b >= g_blocks.Count() || b == g_AirId) return false;
+	if (IsFluidBlock(b)) return false;
+	// Solid full cubes (sand, gravel, stone, …) are never washed away by fluid,
+	// even if they need floor support (gravity blocks).
+	if (IsOpaqueCube(b)) return false;
+	if (IsCross(b)) return true;
 	SupportType s = GetSupportType(b);
 	return s == SupportType::Floor || s == SupportType::WallSide || s == SupportType::Ceiling;
 }
 
+// Sand / gravel / concrete powder — fall when support below is gone (not deleted).
+inline bool IsGravityBlock(BlockId b) {
+	if (b == INVALID_BLOCK_ID || b >= g_blocks.Count()) return false;
+	const std::string& n = g_blocks.Get(b).name;
+	return n == "sand" || n == "red_sand" || n == "gravel" ||
+		n.find("concrete_powder") != std::string::npos;
+}
+
+
 struct KnownBlockIds {
 	BlockId stone, dirt, grass, sand, shortGrass, dandelion, poppy, anvil, oakLog, oakLeaves, torch;
+	BlockId cobblestone, obsidian;
 } g_known;
 
 void ResolveKnownBlockIds() {
@@ -1283,10 +1633,13 @@ void ResolveKnownBlockIds() {
 	g_known.oakLog = g_blocks.Resolve("oak_log");
 	g_known.oakLeaves = g_blocks.Resolve("oak_leaves");
 	g_known.torch = g_blocks.Resolve("torch");
+	g_known.cobblestone = g_blocks.Resolve("cobblestone");
+	g_known.obsidian = g_blocks.Resolve("obsidian");
 
 	BlockId required[] = { g_AirId, g_WaterId, g_LavaId, g_BedrockId,
 		g_known.stone, g_known.dirt, g_known.grass, g_known.sand, g_known.shortGrass,
-		g_known.dandelion, g_known.poppy, g_known.anvil, g_known.oakLog, g_known.oakLeaves, g_known.torch };
+		g_known.dandelion, g_known.poppy, g_known.anvil, g_known.oakLog, g_known.oakLeaves, g_known.torch,
+		g_known.cobblestone, g_known.obsidian };
 	for (BlockId id : required)
 		if (id == INVALID_BLOCK_ID) TraceLog(LOG_ERROR, "ResolveKnownBlockIds: обязательный блок не найден в resources/blockstates!");
 }
@@ -1295,6 +1648,7 @@ void ResolveKnownBlockIds() {
 const VoxelShape& GetBlockShape(BlockId id);
 void DirtyChunksAroundBlock(std::unordered_map<int64_t, Chunk>& chunks, int bx, int by, int bz,
 	int radius, bool geometryChange);
+void NotifyFluidRemoved(int x, int y, int z, BlockId fluidType);
 
 // Assign attachment rules from vanilla block identifiers. The registry remains data-driven:
 // names only describe how blocks attach, not how their models are rendered.
@@ -1325,6 +1679,12 @@ void ConfigureBlockSupportTypes()
 			n.find("flower_pot") != std::string::npos || n.find("decorated_pot") != std::string::npos ||
 			n.find("rail") != std::string::npos;
 
+		// Gravity blocks: need solid support below; fall (removed) when it disappears.
+		// Exact names — avoid matching sandstone / soul_sand / etc.
+		const bool gravityBlock =
+			n == "sand" || n == "red_sand" || n == "gravel" ||
+			n.find("concrete_powder") != std::string::npos;
+
 		const bool wallAttached =
 			n.find("wall_torch") != std::string::npos || n.find("wall_sign") != std::string::npos ||
 			n.find("wall_banner") != std::string::npos || n.find("wall_hanging_sign") != std::string::npos ||
@@ -1339,8 +1699,8 @@ void ConfigureBlockSupportTypes()
 
 		if (ceilingAttached) def.support = SupportType::Ceiling;
 		else if (wallAttached) def.support = SupportType::WallSide;
-		else if (floorAttached) def.support = SupportType::Floor;
-		else if (def.isCross) def.support = SupportType::Floor;   // ← добавлено
+		else if (floorAttached || gravityBlock) def.support = SupportType::Floor;
+		else if (def.isCross) def.support = SupportType::Floor;
 	}
 }
 
@@ -1376,6 +1736,18 @@ static bool HasSupportOnFace(const std::unordered_map<int64_t, Chunk>& chunks,
 	return false;
 }
 
+static std::map<std::string, std::string> GetWorldBlockState(
+	const std::unordered_map<int64_t, Chunk>& chunks, int x, int y, int z)
+{
+	int cx = (int)floorf((float)x / CHUNK_SIZE);
+	int cz = (int)floorf((float)z / CHUNK_SIZE);
+	int lx = x - cx * CHUNK_SIZE;
+	int lz = z - cz * CHUNK_SIZE;
+	auto it = chunks.find(ChunkKey(cx, cz));
+	if (it == chunks.end()) return {};
+	return it->second.GetBlockState(lx, y, lz);
+}
+
 static bool BlockHasRequiredSupport(const std::unordered_map<int64_t, Chunk>& chunks,
 	int x, int y, int z, BlockId id)
 {
@@ -1387,15 +1759,19 @@ static bool BlockHasRequiredSupport(const std::unordered_map<int64_t, Chunk>& ch
 	if (def.support == SupportType::Ceiling)
 		return HasSupportOnFace(chunks, x, y, z, 0, 1, 0);
 
-	// A wall-mounted block's facing points away from its support.
-	auto it = def.defaultState.find("facing");
-	if (it != def.defaultState.end()) {
-		const std::string& facing = it->second;
-		if (facing == "north") return HasSupportOnFace(chunks, x, y, z, 0, 0, 1);
-		if (facing == "south") return HasSupportOnFace(chunks, x, y, z, 0, 0, -1);
-		if (facing == "east") return HasSupportOnFace(chunks, x, y, z, -1, 0, 0);
-		if (facing == "west") return HasSupportOnFace(chunks, x, y, z, 1, 0, 0);
+	// Wall-mounted: prefer stored facing, else defaultState, else any side.
+	std::string facing;
+	auto stored = GetWorldBlockState(chunks, x, y, z);
+	auto sit = stored.find("facing");
+	if (sit != stored.end()) facing = sit->second;
+	else {
+		auto it = def.defaultState.find("facing");
+		if (it != def.defaultState.end()) facing = it->second;
 	}
+	if (facing == "north") return HasSupportOnFace(chunks, x, y, z, 0, 0, 1);
+	if (facing == "south") return HasSupportOnFace(chunks, x, y, z, 0, 0, -1);
+	if (facing == "east") return HasSupportOnFace(chunks, x, y, z, -1, 0, 0);
+	if (facing == "west") return HasSupportOnFace(chunks, x, y, z, 1, 0, 0);
 	return HasSupportOnFace(chunks, x, y, z, 0, -1, 0) ||
 		HasSupportOnFace(chunks, x, y, z, 0, 1, 0) ||
 		HasSupportOnFace(chunks, x, y, z, 1, 0, 0) ||
@@ -1404,8 +1780,69 @@ static bool BlockHasRequiredSupport(const std::unordered_map<int64_t, Chunk>& ch
 		HasSupportOnFace(chunks, x, y, z, 0, 0, -1);
 }
 
-// Called while the world-chunk mutex is held. Unsupported blocks disappear, and
-// the queue naturally handles chains of attached blocks losing their support.
+// Move a gravity block down until it lands on a solid (or hits y==0).
+// Replaces fluid / plants in the way. Called with g_chunksMutex held.
+static void FallGravityBlock(std::unordered_map<int64_t, Chunk>& chunks, int x, int y, int z)
+{
+	int cx = (int)floorf((float)x / CHUNK_SIZE);
+	int cz = (int)floorf((float)z / CHUNK_SIZE);
+	int lx = x - cx * CHUNK_SIZE;
+	int lz = z - cz * CHUNK_SIZE;
+	auto it = chunks.find(ChunkKey(cx, cz));
+	if (it == chunks.end()) return;
+
+	BlockId id = it->second.Get(lx, y, lz);
+	if (!IsGravityBlock(id)) return;
+	std::map<std::string, std::string> state = it->second.GetBlockState(lx, y, lz);
+
+	auto cellIsFree = [&](int wx, int wy, int wz) -> bool {
+		if (wy < 0) return false;
+		int ccx = (int)floorf((float)wx / CHUNK_SIZE);
+		int ccz = (int)floorf((float)wz / CHUNK_SIZE);
+		int llx = wx - ccx * CHUNK_SIZE;
+		int llz = wz - ccz * CHUNK_SIZE;
+		BlockId b = GetWorldBlock(chunks, ccx, ccz, llx, wy, llz);
+		return b == g_AirId || IsFluidBlock(b) || IsReplaceableByFluid(b);
+		};
+
+	int landY = y;
+	while (landY > 0 && cellIsFree(x, landY - 1, z))
+		--landY;
+
+	if (landY == y) {
+		// Nowhere to fall (already on solid, or floating at y==0 with no support).
+		// At y==0 with nothing below — destroy like void fall.
+		if (y == 0 && cellIsFree(x, -1, z)) {
+			it->second.Set(lx, y, lz, g_AirId);
+			DirtyChunksAroundBlock(chunks, x, y, z, 14, true);
+		}
+		return;
+	}
+
+	// Clear origin
+	it->second.Set(lx, y, lz, g_AirId);
+	DirtyChunksAroundBlock(chunks, x, y, z, 14, true);
+
+	// Destination may be in another chunk
+	int dcx = (int)floorf((float)x / CHUNK_SIZE);
+	int dcz = (int)floorf((float)z / CHUNK_SIZE);
+	int dlx = x - dcx * CHUNK_SIZE;
+	int dlz = z - dcz * CHUNK_SIZE;
+	auto dit = chunks.find(ChunkKey(dcx, dcz));
+	if (dit == chunks.end()) return;
+
+	BlockId dest = dit->second.Get(dlx, landY, dlz);
+	if (IsFluidBlock(dest))
+		NotifyFluidRemoved(x, landY, z, dest);
+
+	dit->second.Set(dlx, landY, dlz, id);
+	if (!state.empty())
+		dit->second.SetBlockState(dlx, landY, dlz, state);
+	DirtyChunksAroundBlock(chunks, x, landY, z, 14, true);
+}
+
+// Called while the world-chunk mutex is held. Unsupported plants/torches disappear;
+// gravity blocks (sand/gravel) fall. Chains of attached blocks are handled via the queue.
 static void RemoveUnsupportedBlocks(std::unordered_map<int64_t, Chunk>& chunks,
 	int startX, int startY, int startZ)
 {
@@ -1434,10 +1871,53 @@ static void RemoveUnsupportedBlocks(std::unordered_map<int64_t, Chunk>& chunks,
 		if (current == g_AirId || GetSupportType(current) == SupportType::None) continue;
 		if (BlockHasRequiredSupport(chunks, x, y, z, current)) continue;
 
-		chunkIt->second.Set(lx, y, lz, g_AirId);
-		DirtyChunksAroundBlock(chunks, x, y, z, 14, true);
+		if (IsGravityBlock(current)) {
+			FallGravityBlock(chunks, x, y, z);
+		}
+		else {
+			chunkIt->second.Set(lx, y, lz, g_AirId);
+			DirtyChunksAroundBlock(chunks, x, y, z, 14, true);
+		}
 		for (const auto& d : dirs) pending.push({ x + d[0], y + d[1], z + d[2] });
+		// Also re-check blocks above the landing zone for stacked sand
+		if (IsGravityBlock(current))
+			pending.push({ x, y + 1, z });
 	}
+}
+
+
+// Resolve model for a concrete property map; builds & caches on demand.
+static const BlockModel& GetOrBuildStateModel(BlockId id,
+	const std::map<std::string, std::string>& state,
+	std::map<std::string, Texture2D>& textureCache)
+{
+	static BlockModel empty;
+	if (id == INVALID_BLOCK_ID || id >= g_blocks.Count()) return empty;
+	BlockDef& def = g_blocks.Get(id);
+	std::map<std::string, std::string> full = def.defaultState;
+	for (const auto& [k, v] : state) full[k] = v;
+	const std::string key = SerializeState(full);
+	auto it = def.modelCache.find(key);
+	if (it != def.modelCache.end()) return it->second;
+	BlockModel built = BuildStateModel(def, full, textureCache);
+	auto [ins, _] = def.modelCache.emplace(key, std::move(built));
+	return ins->second;
+}
+
+static const VoxelShape& GetOrBuildStateShape(BlockId id,
+	const std::map<std::string, std::string>& state)
+{
+	static VoxelShape empty;
+	if (id == INVALID_BLOCK_ID || id >= g_blocks.Count()) return empty;
+	BlockDef& def = g_blocks.Get(id);
+	std::map<std::string, std::string> full = def.defaultState;
+	for (const auto& [k, v] : state) full[k] = v;
+	const std::string key = SerializeState(full);
+	auto it = def.shapeCache.find(key);
+	if (it != def.shapeCache.end()) return it->second;
+	VoxelShape built = BuildStateVoxelShape(def, full);
+	auto [ins, _] = def.shapeCache.emplace(key, std::move(built));
+	return ins->second;
 }
 
 const VoxelShape& GetBlockShape(BlockId id) {
@@ -1446,6 +1926,11 @@ const VoxelShape& GetBlockShape(BlockId id) {
 	auto it = g_blocks.Get(id).shapeCache.find("");
 	return it == g_blocks.Get(id).shapeCache.end() ? empty : it->second;
 }
+
+const VoxelShape& GetBlockShapeWithState(BlockId id, const std::map<std::string, std::string>& state) {
+	return GetOrBuildStateShape(id, state);
+}
+
 
 Color TintColorFor(BlockId id) {
 	if (id >= g_blocks.Count()) return { 110,190,70,255 };
@@ -1546,7 +2031,7 @@ void DrawBlockOutline(const VoxelShape& shape, Vector3 blockOrigin, Vector3 came
 }
 
 BlockHit RaycastBlock(const std::unordered_map<int64_t, Chunk>& chunks,
-	Vector3 origin, Vector3 direction, float maxDistance)
+	Vector3 origin, Vector3 direction, float maxDistance, bool includeFluids = false)
 {
 	BlockHit result;
 	direction = Vector3Normalize(direction);
@@ -1574,19 +2059,33 @@ BlockHit RaycastBlock(const std::unordered_map<int64_t, Chunk>& chunks,
 			int lx = x - cx * CHUNK_SIZE;
 			int lz = z - cz * CHUNK_SIZE;
 			BlockId type = GetWorldBlock(chunks, cx, cz, lx, y, lz);
-			if (type != g_AirId && type != g_WaterId && type != g_LavaId) {
-				const VoxelShape& shape = GetBlockShape(type);
-				if (!shape.boxes.empty()) {
-					Vector3 blockOrigin{ (float)x, (float)y, (float)z };
-					float t; Vector3 n;
-					if (RaycastVoxelShape(shape, blockOrigin, origin, direction, maxDistance, t, n)) {
-						result.hit = true;
-						result.x = x; result.y = y; result.z = z; result.type = type;
-						result.nx = (int)roundf(n.x);
-						result.ny = (int)roundf(n.y);
-						result.nz = (int)roundf(n.z);
-						return result;
-					}
+			const bool fluid = (type == g_WaterId || type == g_LavaId);
+			if (type != g_AirId && (!fluid || includeFluids)) {
+				Vector3 blockOrigin{ (float)x, (float)y, (float)z };
+				float t; Vector3 n;
+				bool hit = false;
+				if (fluid) {
+					// Fluids use a full-block AABB for targeting (pick-block etc.)
+					static const VoxelShape kFluidShape = [] {
+						VoxelShape s;
+						s.boxes.push_back({ {0,0,0},{1,1,1} });
+						s.isFullCube = true;
+						return s;
+						}();
+					hit = RaycastVoxelShape(kFluidShape, blockOrigin, origin, direction, maxDistance, t, n);
+				}
+				else {
+					const VoxelShape& shape = GetBlockShape(type);
+					if (!shape.boxes.empty())
+						hit = RaycastVoxelShape(shape, blockOrigin, origin, direction, maxDistance, t, n);
+				}
+				if (hit) {
+					result.hit = true;
+					result.x = x; result.y = y; result.z = z; result.type = type;
+					result.nx = (int)roundf(n.x);
+					result.ny = (int)roundf(n.y);
+					result.nz = (int)roundf(n.z);
+					return result;
 				}
 			}
 		}
@@ -1602,19 +2101,87 @@ BlockHit RaycastBlock(const std::unordered_map<int64_t, Chunk>& chunks,
 	return result;
 }
 
-FastNoiseLite g_terrainNoise;
+// ---- World gen (FastNoiseLite) ----
+// Multi-scale land: continuous ocean + continents + small/medium/large/merged islands.
+// Caves: spaghetti tunnels + cheese chambers + noodle shafts + deep caverns.
+FastNoiseLite g_continentNoise;
+FastNoiseLite g_warpNoise;
+FastNoiseLite g_islandSmall;
+FastNoiseLite g_islandMed;
+FastNoiseLite g_islandLarge;
+FastNoiseLite g_ridgeNoise;
+FastNoiseLite g_detailNoise;
+FastNoiseLite g_oceanFloorNoise;
+
+FastNoiseLite g_caveA, g_caveB, g_caveNoodle, g_cheese, g_cavern;
+
+static void ConfigureFBm(FastNoiseLite& n, int seed, float freq, int octaves = 4)
+{
+	n.SetSeed(seed);
+	n.SetNoiseType(FastNoiseLite::NoiseType_OpenSimplex2);
+	n.SetFractalType(FastNoiseLite::FractalType_FBm);
+	n.SetFractalOctaves(octaves);
+	n.SetFractalLacunarity(2.0f);
+	n.SetFractalGain(0.5f);
+	n.SetFrequency(freq);
+}
 
 void InitTerrainNoise(int seed) {
-	g_terrainNoise.SetSeed(seed);
-	g_terrainNoise.SetNoiseType(FastNoiseLite::NoiseType_Perlin);
-	g_terrainNoise.SetFractalType(FastNoiseLite::FractalType_FBm);
-	g_terrainNoise.SetFractalOctaves(4);
-	g_terrainNoise.SetFractalLacunarity(2.0f);
-	g_terrainNoise.SetFractalGain(0.5f);
-	g_terrainNoise.SetFrequency(0.015f);
+	// Continents — more land, softer coasts
+	ConfigureFBm(g_continentNoise, seed + 11, 0.0022f, 4);
+	ConfigureFBm(g_warpNoise, seed + 17, 0.0028f, 2);
+
+	// Broader island frequencies → round shapes, not needles
+	ConfigureFBm(g_islandSmall, seed + 22, 0.0085f, 3);
+	ConfigureFBm(g_islandMed, seed + 28, 0.0050f, 4);
+	ConfigureFBm(g_islandLarge, seed + 34, 0.0032f, 4);
+
+	// Mild ridged variation only
+	g_ridgeNoise.SetSeed(seed + 40);
+	g_ridgeNoise.SetNoiseType(FastNoiseLite::NoiseType_OpenSimplex2);
+	g_ridgeNoise.SetFractalType(FastNoiseLite::FractalType_Ridged);
+	g_ridgeNoise.SetFractalOctaves(2);
+	g_ridgeNoise.SetFractalLacunarity(2.0f);
+	g_ridgeNoise.SetFractalGain(0.4f);
+	g_ridgeNoise.SetFrequency(0.0055f);
+
+	ConfigureFBm(g_detailNoise, seed + 50, 0.018f, 3);
+	ConfigureFBm(g_oceanFloorNoise, seed + 60, 0.009f, 3);
+}
+
+void InitCaveNoise(int seed) {
+	for (FastNoiseLite* n : { &g_caveA, &g_caveB, &g_caveNoodle }) {
+		n->SetNoiseType(FastNoiseLite::NoiseType_Perlin);
+		n->SetFractalType(FastNoiseLite::FractalType_None);
+	}
+	g_caveA.SetSeed(seed + 1000);     g_caveA.SetFrequency(0.022f);
+	g_caveB.SetSeed(seed + 2000);     g_caveB.SetFrequency(0.022f);
+	g_caveNoodle.SetSeed(seed + 2500); g_caveNoodle.SetFrequency(0.028f);
+
+	g_cheese.SetSeed(seed + 3000);
+	g_cheese.SetNoiseType(FastNoiseLite::NoiseType_OpenSimplex2);
+	g_cheese.SetFractalType(FastNoiseLite::FractalType_FBm);
+	g_cheese.SetFractalOctaves(2);
+	g_cheese.SetFrequency(0.013f);
+
+	g_cavern.SetSeed(seed + 4000);
+	g_cavern.SetNoiseType(FastNoiseLite::NoiseType_OpenSimplex2);
+	g_cavern.SetFractalType(FastNoiseLite::FractalType_FBm);
+	g_cavern.SetFractalOctaves(3);
+	g_cavern.SetFrequency(0.0055f);
 }
 
 int g_worldSeed = 0;
+// 0 = normal terrain, 1 = flat (bedrock + 3 stone + 2 dirt + 1 grass)
+int g_worldType = 0;
+// Bumped on every world-type / full regen so in-flight jobs from the old world are discarded.
+std::atomic<int> g_worldGenEpoch{ 0 };
+// Set when World Type changes — forces streaming to rebuild the generation queue.
+bool g_forceWorldRescan = false;
+
+// Flat world surface Y (grass layer). Layers below:
+// y=0 bedrock, y=1..3 stone, y=4..5 dirt, y=6 grass
+static constexpr int FLAT_SURFACE_Y = 6;
 
 inline uint32_t HashU32(uint32_t h) {
 	h ^= h >> 16; h *= 0x7feb352dU; h ^= h >> 15; h *= 0x846ca68bU; h ^= h >> 16;
@@ -1626,38 +2193,101 @@ float Hash01(int x, int y, int z, int salt) {
 	return (h & 0xFFFFFF) / 16777216.0f;
 }
 
+static float SmoothStep(float e0, float e1, float x) {
+	float t = (x - e0) / (e1 - e0);
+	t = t < 0.0f ? 0.0f : (t > 1.0f ? 1.0f : t);
+	return t * t * (3.0f - 2.0f * t);
+}
+
+// Continuous ocean with a good amount of soft land: continents + rounded islands.
 int SurfaceHeightAt(int wx, int wz) {
-	float raw = g_terrainNoise.GetNoise((float)wx, (float)wz);
-	return 20 + (int)(((raw + 1.0f) * 0.5f) * 40);
+	const float fx = (float)wx, fz = (float)wz;
+
+	// Mild warp — keeps coasts natural without sharp spikes
+	const float wxp = fx + g_warpNoise.GetNoise(fx, fz) * 12.0f;
+	const float wzp = fz + g_warpNoise.GetNoise(fx + 100.0f, fz - 50.0f) * 12.0f;
+
+	const float continent = g_continentNoise.GetNoise(wxp, wzp);
+	const float smallI = g_islandSmall.GetNoise(fx, fz);
+	const float medI = g_islandMed.GetNoise(fx, fz);
+	const float largeI = g_islandLarge.GetNoise(wxp, wzp);
+	const float ridge = g_ridgeNoise.GetNoise(fx, fz);
+	const float detail = g_detailNoise.GetNoise(fx, fz);
+	const float floorN = g_oceanFloorNoise.GetNoise(fx, fz);
+
+	// ~35–45% land from continents (lower threshold = more land)
+	const float landMask = SmoothStep(0.05f, 0.40f, continent);
+
+	const float oceanOnly = 1.0f - landMask * 0.85f; // allow islands near coasts too
+
+	// Soft island masks (wide smoothstep → round shapes, not needles)
+	float smallMask = oceanOnly * SmoothStep(0.35f, 0.65f, smallI);
+	float medMask = oceanOnly * SmoothStep(0.22f, 0.55f, medI * 0.85f + ridge * 0.15f);
+	float largeMask = oceanOnly * SmoothStep(0.30f, 0.60f, largeI);
+
+	float islandMask = std::max(std::max(smallMask, medMask), largeMask);
+	islandMask = std::min(1.0f, islandMask);
+
+	const float surfaceMask = std::max(landMask, islandMask);
+
+	const float oceanFloor = (float)(SEA_LEVEL - 12) + floorN * 6.0f;
+
+	// Gentle hills — limited amplitude so no spiky peaks
+	const float contH = (float)SEA_LEVEL + 2.0f
+		+ landMask * (8.0f + detail * 8.0f + continent * 4.0f);
+	const float islH = (float)SEA_LEVEL + 1.5f
+		+ smallMask * (3.0f + detail * 3.0f)
+		+ medMask * (5.0f + detail * 5.0f)
+		+ largeMask * (7.0f + detail * 6.0f);
+
+	const float landH = std::max(contH, islH);
+	float h = oceanFloor + (landH - oceanFloor) * surfaceMask;
+
+	if (surfaceMask < 0.02f)
+		h = oceanFloor;
+
+	int ih = (int)std::lround(h);
+	if (ih < 4) ih = 4;
+	if (ih > WORLD_HEIGHT - 32) ih = WORLD_HEIGHT - 32;
+	return ih;
 }
 
-FastNoiseLite g_caveA, g_caveB, g_cheese;
-
-void InitCaveNoise(int seed) {
-	for (FastNoiseLite* n : { &g_caveA, &g_caveB, &g_cheese }) {
-		n->SetNoiseType(FastNoiseLite::NoiseType_Perlin);
-		n->SetFractalType(FastNoiseLite::FractalType_None);
-	}
-	g_caveA.SetSeed(seed + 1000);  g_caveA.SetFrequency(0.018f);
-	g_caveB.SetSeed(seed + 2000);  g_caveB.SetFrequency(0.018f);
-	g_cheese.SetSeed(seed + 3000); g_cheese.SetFrequency(0.012f);
-}
-
+// Combined caves: spaghetti + cheese + vertical noodles + deep caverns.
 bool IsCaveAt(int wx, int wy, int wz, int surface) {
 	if (wy <= 5) return false;
-	int depth = surface - wy;
-	if (depth < 0) return false;
-	if (surface <= SEA_LEVEL + 1 && depth < 6) return false;
+	if (wy >= surface) return false;
+	const int depth = surface - wy;
+	if (depth < 3) return false;
+	// Sealed roof under seabed so the continuous ocean does not drain
+	if (surface <= SEA_LEVEL + 2 && depth < 10) return false;
 
-	float x = (float)wx, y = (float)wy, z = (float)wz;
+	const float x = (float)wx, y = (float)wy, z = (float)wz;
 
-	float a = g_caveA.GetNoise(x, y * 1.4f, z);
-	float b = g_caveB.GetNoise(x, y * 1.4f, z);
-	float t = 0.06f + 0.04f * std::min(depth / 40.0f, 1.0f);
-	if (a * a + b * b < t * t) return true;
+	// Spaghetti tunnels (two 3D fields, spherical threshold)
+	const float a = g_caveA.GetNoise(x, y * 1.5f, z);
+	const float b = g_caveB.GetNoise(x, y * 1.5f, z);
+	const float spaghettiR = 0.048f + 0.06f * std::min(depth / 40.0f, 1.0f);
+	if (a * a + b * b < spaghettiR * spaghettiR)
+		return true;
 
-	if (depth > 10) {
-		if (g_cheese.GetNoise(x, y * 2.0f, z) > 0.45f) return true;
+	// Vertical "noodle" shafts — stretch noise along Y less so caves go up/down
+	if (depth > 6) {
+		const float n = g_caveNoodle.GetNoise(x * 1.1f, y * 0.55f, z * 1.1f);
+		const float m = g_caveA.GetNoise(x * 0.7f + 40.0f, y * 0.5f, z * 0.7f - 20.0f);
+		if (n * n + m * m < 0.028f)
+			return true;
+	}
+
+	// Cheese chambers (mid depths)
+	if (depth > 7) {
+		const float c = g_cheese.GetNoise(x * 0.9f, y * 1.1f, z * 0.9f);
+		if (c > 0.48f) return true;
+	}
+
+	// Large deep caverns under sea level
+	if (depth > 16 && wy < SEA_LEVEL - 2) {
+		const float v = g_cavern.GetNoise(x * 0.4f, y * 0.5f, z * 0.4f);
+		if (v > 0.52f) return true;
 	}
 	return false;
 }
@@ -1721,26 +2351,51 @@ MeshData BuildChunkMeshData(const Chunk& chunk, const std::unordered_map<int64_t
 	PartMap solidParts, waterParts;
 	std::map<unsigned int, unsigned int> splitIndex;
 
+	auto ensurePartCapacity = [&](PartMap& dst, const FaceInfo& face, MeshData::Part*& part) {
+		// Batch by atlas page; keep tinted faces on a separate material so grass
+		// tint does not leak onto non-tinted blocks sharing the same page.
+		int page = g_atlas.PageOf(face.texture.id);
+		unsigned int keyId;
+		if (page >= 0)
+			keyId = (unsigned int)(0xA0000000u | ((unsigned)page << 1) | (face.tinted ? 1u : 0u));
+		else
+			keyId = face.texture.id ^ (face.tinted ? 0x80000000u : 0u);
+		unsigned int& split = splitIndex[keyId];
+		uint64_t k = (uint64_t)keyId | ((uint64_t)split << 32);
+		part = &dst[k];
+		if (part->vertices.size() + 4 > 65000) {
+			split++;
+			k = (uint64_t)keyId | ((uint64_t)split << 32);
+			part = &dst[k];
+		}
+		if (page >= 0) part->texture = g_atlas.PageTexture(page);
+		else part->texture = face.texture;
+		};
+	auto mapFaceUV = [&](const FaceInfo& face, Vector2 uv) -> Vector2 {
+		// Non-square textures: preserve aspect as before, then remap into atlas cell
+		float vs = (face.texture.height > 0)
+			? (float)face.texture.width / (float)face.texture.height : 1.0f;
+		uv.y *= vs;
+		return g_atlas.MapUV(face.texture.id, uv);
+		};
+
 	auto addQuad = [&](PartMap& dst, const FaceInfo& face, Color tintColor,
 		Vector3 v1, Vector2 uv1, Vector3 v2, Vector2 uv2,
 		Vector3 v3, Vector2 uv3, Vector3 v4, Vector2 uv4,
 		Vector3 normal, float shade, float sky, float blk)
 		{
-			unsigned int& split = splitIndex[face.texture.id];
-			MeshData::Part* part = &dst[(uint64_t)face.texture.id | ((uint64_t)split << 32)];
-			if (part->vertices.size() + 4 > 65000) {
-				split++;
-				part = &dst[(uint64_t)face.texture.id | ((uint64_t)split << 32)];
-			}
-			part->texture = face.texture;
+			MeshData::Part* part = nullptr;
+			ensurePartCapacity(dst, face, part);
 
 			if (face.tinted) {
 				part->tinted = true;
 				part->tintColor = tintColor;
 			}
 
-			float vs = (float)face.texture.width / (float)face.texture.height;
-			uv1.y *= vs; uv2.y *= vs; uv3.y *= vs; uv4.y *= vs;
+			uv1 = mapFaceUV(face, uv1);
+			uv2 = mapFaceUV(face, uv2);
+			uv3 = mapFaceUV(face, uv3);
+			uv4 = mapFaceUV(face, uv4);
 
 			Color col = {
 				(unsigned char)(255.0f * shade),
@@ -1766,21 +2421,18 @@ MeshData BuildChunkMeshData(const Chunk& chunk, const std::unordered_map<int64_t
 		Vector3 v4, Vector2 uv4, Vector2 l4,
 		Vector3 normal, float shade)
 		{
-			unsigned int& split = splitIndex[face.texture.id];
-			MeshData::Part* part = &dst[(uint64_t)face.texture.id | ((uint64_t)split << 32)];
-			if (part->vertices.size() + 4 > 65000) {
-				split++;
-				part = &dst[(uint64_t)face.texture.id | ((uint64_t)split << 32)];
-			}
-			part->texture = face.texture;
+			MeshData::Part* part = nullptr;
+			ensurePartCapacity(dst, face, part);
 
 			if (face.tinted) {
 				part->tinted = true;
 				part->tintColor = tintColor;
 			}
 
-			float vs = (float)face.texture.width / (float)face.texture.height;
-			uv1.y *= vs; uv2.y *= vs; uv3.y *= vs; uv4.y *= vs;
+			uv1 = mapFaceUV(face, uv1);
+			uv2 = mapFaceUV(face, uv2);
+			uv3 = mapFaceUV(face, uv3);
+			uv4 = mapFaceUV(face, uv4);
 
 			auto colFor = [&](Vector2 l) -> Color {
 				return {
@@ -1804,24 +2456,29 @@ MeshData BuildChunkMeshData(const Chunk& chunk, const std::unordered_map<int64_t
 	// Универсальный путь: рисует ПОЛНУЮ geometry блока из реестра (без culling граней,
 	// подходит для всего, что не является быстрым полным кубом: лестницы, плиты, заборы,
 	// двери, факелы, наковальня и т.д.)
-	auto addGenericModel = [&](BlockId block, float wx, float wy, float wz, float sky, float blk) {
-		if (block >= g_blocks.Count()) return;
-		const BlockDef& def = g_blocks.Get(block);
-		auto it = def.modelCache.find("");
-		if (it == def.modelCache.end()) return;
-		Vector3 origin{ wx, wy, wz };
-		Color tint = TintColorFor(block);
-		float constShade = (def.support != SupportType::None && !def.isCross) ? 1.0f : -1.0f; // факелы/баннеры и т.п. светятся ровно
-		for (const auto& q : it->second.quads) {
-			FaceInfo face{ q.texture, q.tinted };
-			float shade = (constShade > 0.0f) ? constShade : ShadeForNormal(q.normal);
-			addQuad(solidParts, face, tint,
-				Vector3Add(origin, q.v[0]), q.uv[0],
-				Vector3Add(origin, q.v[1]), q.uv[1],
-				Vector3Add(origin, q.v[2]), q.uv[2],
-				Vector3Add(origin, q.v[3]), q.uv[3],
-				q.normal, shade, sky, blk);
-		}
+	auto addGenericModel = [&](BlockId block, float wx, float wy, float wz, float sky, float blk,
+		const std::map<std::string, std::string>& state) {
+			if (block >= g_blocks.Count()) return;
+			const BlockDef& def = g_blocks.Get(block);
+			std::map<std::string, std::string> full = def.defaultState;
+			for (const auto& [k, v] : state) full[k] = v;
+			const std::string key = SerializeState(full);
+			auto it = def.modelCache.find(key);
+			if (it == def.modelCache.end()) it = def.modelCache.find("");
+			if (it == def.modelCache.end()) return;
+			Vector3 origin{ wx, wy, wz };
+			Color tint = TintColorFor(block);
+			float constShade = (def.support != SupportType::None && !def.isCross) ? 1.0f : -1.0f;
+			for (const auto& q : it->second.quads) {
+				FaceInfo face{ q.texture, q.tinted };
+				float shade = (constShade > 0.0f) ? constShade : ShadeForNormal(q.normal);
+				addQuad(solidParts, face, tint,
+					Vector3Add(origin, q.v[0]), q.uv[0],
+					Vector3Add(origin, q.v[1]), q.uv[1],
+					Vector3Add(origin, q.v[2]), q.uv[2],
+					Vector3Add(origin, q.v[3]), q.uv[3],
+					q.normal, shade, sky, blk);
+			}
 		};
 
 	auto addCross = [&](BlockId block, const FaceInfo& face, float wx, float wy, float wz, float sky, float blk) {
@@ -2058,7 +2715,7 @@ MeshData BuildChunkMeshData(const Chunk& chunk, const std::unordered_map<int64_t
 					// Универсальный путь: любые нестандартные формы (лестницы, плиты, заборы,
 					// двери, факелы, наковальня, знаки и т.д.) — без culling граней.
 					Vector2 L = sampleLight(x, y, z);
-					addGenericModel(block, wx, wy, wz, L.x, L.y);
+					addGenericModel(block, wx, wy, wz, L.x, L.y, chunk.GetBlockState(x, y, z));
 					continue;
 				}
 
@@ -2160,8 +2817,10 @@ static Model BuildModelFromParts(std::vector<MeshData::Part>& parts, bool /*cuto
 }
 
 void UploadChunkMesh(Chunk& chunk, MeshData&& md) {
-	if (chunk.hasMesh) { UnloadModel(chunk.model);
-		chunk.hasMesh = false; }
+	if (chunk.hasMesh) {
+		UnloadModel(chunk.model);
+		chunk.hasMesh = false;
+	}
 
 	if (chunk.hasWaterMesh) {
 		UnloadModel(chunk.waterModel);
@@ -2181,6 +2840,7 @@ void UploadChunkMesh(Chunk& chunk, MeshData&& md) {
 
 struct ChunkBuildResult {
 	int64_t key = 0;
+	int epoch = 0; // must match g_worldGenEpoch or result is discarded
 	Chunk chunk;
 	MeshData meshData;
 	bool hasMeshData = false;
@@ -2198,15 +2858,37 @@ Chunk GenerateTerrainChunk(int chunkX, int chunkZ) {
 	auto setB = [&](int x, int y, int z, BlockId t) { chunk.dense[idx(x, y, z)] = t; };
 	for (int i = 0; i < CHUNK_SIZE * WORLD_HEIGHT * CHUNK_SIZE; i++) chunk.dense[i] = g_AirId;
 
+	// ---- Flat world: 1 bedrock, 3 stone, 2 dirt, 1 grass. No plants, caves, water. ----
+	if (g_worldType == 1) {
+		for (int x = 0; x < CHUNK_SIZE; x++) {
+			for (int z = 0; z < CHUNK_SIZE; z++) {
+				setB(x, 0, z, g_BedrockId);
+				setB(x, 1, z, g_known.stone);
+				setB(x, 2, z, g_known.stone);
+				setB(x, 3, z, g_known.stone);
+				setB(x, 4, z, g_known.dirt);
+				setB(x, 5, z, g_known.dirt);
+				setB(x, 6, z, g_known.grass);
+			}
+		}
+		chunk.Optimize();
+		return chunk;
+	}
+
 	int heights[CHUNK_SIZE][CHUNK_SIZE];
 
+	// ---- Terrain column fill ----
 	for (int x = 0; x < CHUNK_SIZE; x++) {
 		for (int z = 0; z < CHUNK_SIZE; z++) {
 			int wx = chunkX * CHUNK_SIZE + x;
 			int wz = chunkZ * CHUNK_SIZE + z;
 			int surface = SurfaceHeightAt(wx, wz);
 			heights[x][z] = surface;
-			bool beach = surface <= SEA_LEVEL + 1;
+
+			const bool underSea = surface < SEA_LEVEL;
+			const bool beach = surface >= SEA_LEVEL - 1 && surface <= SEA_LEVEL + 2;
+			const bool tinyIsland = !underSea && surface <= SEA_LEVEL + 4
+				&& Hash01(wx, 0, wz, 91) > 0.55f;
 
 			int top = std::max(surface, SEA_LEVEL);
 			for (int y = 0; y <= top; y++) {
@@ -2218,87 +2900,118 @@ Chunk GenerateTerrainChunk(int chunkX, int chunkZ) {
 					t = (Hash01(wx, y, wz, 11) < (5 - y) / 5.0f) ? g_BedrockId : g_known.stone;
 				}
 				else if (y <= surface) {
-					if (IsCaveAt(wx, y, wz, surface))   t = g_AirId;
-					else if (y < surface - 3)           t = g_known.stone;
-					else if (y < surface)               t = beach ? g_known.sand : g_known.dirt;
-					else                                t = beach ? g_known.sand : g_known.grass;
+					if (IsCaveAt(wx, y, wz, surface)) {
+						t = g_AirId;
+					}
+					else if (y < surface - 4) {
+						t = g_known.stone;
+					}
+					else if (y < surface) {
+						t = (beach || underSea || tinyIsland) ? g_known.sand : g_known.dirt;
+					}
+					else {
+						// Top block
+						if (underSea) t = g_known.sand;
+						else if (beach || tinyIsland) t = g_known.sand;
+						else t = g_known.grass;
+					}
 				}
 				else {
-					t = g_WaterId;
+					t = g_WaterId; // ocean fill up to sea level
 				}
 				setB(x, y, z, t);
 			}
 		}
 	}
 
+	// ---- Surface decoration (grass / flowers) ----
 	for (int x = 0; x < CHUNK_SIZE; x++) {
 		for (int z = 0; z < CHUNK_SIZE; z++) {
 			int s = heights[x][z];
-			if (s + 1 >= WORLD_HEIGHT) continue;
+			if (s <= SEA_LEVEL || s + 1 >= WORLD_HEIGHT) continue;
 			if (getB(x, s, z) != g_known.grass) continue;
 			if (getB(x, s + 1, z) != g_AirId) continue;
 
 			int wx = chunkX * CHUNK_SIZE + x, wz = chunkZ * CHUNK_SIZE + z;
 			float r = Hash01(wx, s, wz, 77);
-			if (r < 0.15f) setB(x, s + 1, z, g_known.shortGrass);
-			else if (r < 0.16f) setB(x, s + 1, z, g_known.dandelion);
-			else if (r < 0.17f) setB(x, s + 1, z, g_known.poppy);
+			if (r < 0.18f) setB(x, s + 1, z, g_known.shortGrass);
+			else if (r < 0.195f) setB(x, s + 1, z, g_known.dandelion);
+			else if (r < 0.21f) setB(x, s + 1, z, g_known.poppy);
 		}
 	}
 
-	for (int x = 0; x < CHUNK_SIZE; x++) {
-		for (int z = 0; z < CHUNK_SIZE; z++) {
-			int surface = heights[x][z];
-			if (surface + 1 >= WORLD_HEIGHT || getB(x, surface, z) != g_known.grass ||
-				getB(x, surface + 1, z) != g_AirId) continue;
-			int wx = chunkX * CHUNK_SIZE + x;
-			int wz = chunkZ * CHUNK_SIZE + z;
-			if (Hash01(wx, surface, wz, 333) < 0.0012f)
-				setB(x, surface + 1, z, g_known.anvil);
-		}
-	}
+	// ---- Trees (oak) on land above beach ----
+	{
+		const int R = 2;
+		for (int tx = -R; tx < CHUNK_SIZE + R; tx++) {
+			for (int tz = -R; tz < CHUNK_SIZE + R; tz++) {
+				int wx = chunkX * CHUNK_SIZE + tx;
+				int wz = chunkZ * CHUNK_SIZE + tz;
+				if (Hash01(wx, 0, wz, 500) > 0.014f) continue;
 
-	for (int wx : { 27, 30, 33, 36, 39 }) {
-		const int wz = 32;
-		if (wx < chunkX * CHUNK_SIZE || wx >= (chunkX + 1) * CHUNK_SIZE ||
-			wz < chunkZ * CHUNK_SIZE || wz >= (chunkZ + 1) * CHUNK_SIZE) continue;
-		int lx = wx - chunkX * CHUNK_SIZE;
-		int lz = wz - chunkZ * CHUNK_SIZE;
-		int surface = heights[lx][lz];
-		if (surface + 1 < WORLD_HEIGHT && getB(lx, surface, lz) == g_known.grass)
-			setB(lx, surface + 1, lz, g_known.anvil);
-	}
+				int surface = SurfaceHeightAt(wx, wz);
+				if (surface <= SEA_LEVEL + 2) continue;
+				if (IsCaveAt(wx, surface, wz, surface)) continue;
+				int h = 4 + (int)(Hash01(wx, 1, wz, 501) * 4.0f);
+				if (surface + h + 2 >= WORLD_HEIGHT) continue;
 
-	const int R = 2;
-	for (int tx = -R; tx < CHUNK_SIZE + R; tx++) {
-		for (int tz = -R; tz < CHUNK_SIZE + R; tz++) {
-			int wx = chunkX * CHUNK_SIZE + tx;
-			int wz = chunkZ * CHUNK_SIZE + tz;
-			if (Hash01(wx, 0, wz, 500) > 0.012f) continue;
-
-			int surface = SurfaceHeightAt(wx, wz);
-			if (surface <= SEA_LEVEL + 1) continue;
-			if (IsCaveAt(wx, surface, wz, surface)) continue;
-			int h = 4 + (int)(Hash01(wx, 1, wz, 501) * 3.0f);
-			if (surface + h + 2 >= WORLD_HEIGHT) continue;
-
-			int top = surface + h;
-			for (int dy = -2; dy <= 1; dy++) {
-				int yy = top + dy;
-				int r = (dy <= -1) ? 2 : 1;
-				for (int dx = -r; dx <= r; dx++) {
-					for (int dz = -r; dz <= r; dz++) {
-						bool corner = (abs(dx) == r && abs(dz) == r);
-						if (corner && (dy == 1 || Hash01(wx + dx, yy, wz + dz, 502) < 0.5f)) continue;
-						int lx = tx + dx, lz = tz + dz;
-						if (lx < 0 || lx >= CHUNK_SIZE || lz < 0 || lz >= CHUNK_SIZE) continue;
-						if (getB(lx, yy, lz) == g_AirId)
-							setB(lx, yy, lz, g_known.oakLeaves);
+				int top = surface + h;
+				for (int dy = -2; dy <= 1; dy++) {
+					int yy = top + dy;
+					int r = (dy <= -1) ? 2 : 1;
+					for (int dx = -r; dx <= r; dx++) {
+						for (int dz = -r; dz <= r; dz++) {
+							bool corner = (abs(dx) == r && abs(dz) == r);
+							if (corner && (dy == 1 || Hash01(wx + dx, yy, wz + dz, 502) < 0.5f)) continue;
+							int lx = tx + dx, lz = tz + dz;
+							if (lx < 0 || lx >= CHUNK_SIZE || lz < 0 || lz >= CHUNK_SIZE) continue;
+							if (getB(lx, yy, lz) == g_AirId)
+								setB(lx, yy, lz, g_known.oakLeaves);
+						}
 					}
 				}
+				if (tx >= 0 && tx < CHUNK_SIZE && tz >= 0 && tz < CHUNK_SIZE) {
+					if (getB(tx, surface, tz) == g_known.grass || getB(tx, surface, tz) == g_known.dirt)
+						for (int i = 1; i <= h; i++)
+							if (getB(tx, surface + i, tz) == g_AirId || getB(tx, surface + i, tz) == g_known.oakLeaves)
+								setB(tx, surface + i, tz, g_known.oakLog);
+				}
 			}
-			if (tx >= 0 && tx < CHUNK_SIZE && tz >= 0 && tz < CHUNK_SIZE) {
-				for (int i = 1; i <= h; i++) setB(tx, surface + i, tz, g_known.oakLog);
+		}
+	}
+
+	// ---- Stone outcrops: replace surface dirt/grass with pure stone (no grass on top) ----
+	for (int x = 1; x < CHUNK_SIZE - 1; x++) {
+		for (int z = 1; z < CHUNK_SIZE - 1; z++) {
+			int s = heights[x][z];
+			if (s <= SEA_LEVEL + 4) continue;
+			int wx = chunkX * CHUNK_SIZE + x, wz = chunkZ * CHUNK_SIZE + z;
+			if (Hash01(wx, s, wz, 640) > 0.008f) continue;
+			int hDiff = abs(heights[x][z] - heights[x - 1][z])
+				+ abs(heights[x][z] - heights[x][z - 1]);
+			if (hDiff < 4) continue; // only on steeper slopes
+
+			// Carve a small pure-stone patch: surface + 0–1 above, strip grass/dirt
+			const int radius = 1;
+			for (int dx = -radius; dx <= radius; dx++) {
+				for (int dz = -radius; dz <= radius; dz++) {
+					int lx = x + dx, lz = z + dz;
+					if (lx < 0 || lx >= CHUNK_SIZE || lz < 0 || lz >= CHUNK_SIZE) continue;
+					int sy = heights[lx][lz];
+					if (sy <= SEA_LEVEL) continue;
+					// Top layers become stone (no grass/dirt left on the outcrop)
+					for (int dy = 0; dy <= 2 && sy - dy > 4; dy++) {
+						BlockId cur = getB(lx, sy - dy, lz);
+						if (cur == g_known.grass || cur == g_known.dirt || cur == g_known.stone)
+							setB(lx, sy - dy, lz, g_known.stone);
+					}
+					// Clear vegetation above
+					if (sy + 1 < WORLD_HEIGHT) {
+						BlockId above = getB(lx, sy + 1, lz);
+						if (above == g_known.shortGrass || IsCross(above))
+							setB(lx, sy + 1, lz, g_AirId);
+					}
+				}
 			}
 		}
 	}
@@ -2373,6 +3086,7 @@ static void FlattenInto(const Chunk& src, Chunk& dst)
 
 	dst.lightSourcePositions = src.lightSourcePositions;
 	dst.fluidLevels = src.fluidLevels;
+	dst.blockStates = src.blockStates;
 
 	if (src.skyLight && src.blockLight)
 	{
@@ -2403,6 +3117,7 @@ void WorkerThreadFunc() {
 			if (hasGenJob) {
 				ChunkBuildResult result;
 				result.key = ChunkKey(job.x, job.z);
+				result.epoch = g_worldGenEpoch.load(std::memory_order_relaxed);
 				try {
 					result.chunk = GenerateTerrainChunk(job.x, job.z);
 				}
@@ -2413,6 +3128,11 @@ void WorkerThreadFunc() {
 					continue;
 				}
 				std::lock_guard<std::mutex> lock(queueMutex);
+				// Drop work from a previous world type / regen
+				if (result.epoch != g_worldGenEpoch.load(std::memory_order_relaxed)) {
+					g_inFlight.erase(result.key);
+					continue;
+				}
 				finishedChunks.push(std::move(result));
 				didWork = true;
 				// After generating, immediately loop again to drain generation
@@ -2566,6 +3286,49 @@ void EnqueueFluidUpdate(int x, int y, int z, BlockId fluidType) {
 	else { if (g_lavaQueuedSet.insert(p).second) g_lavaQueue.push(p); }
 }
 
+// After a fluid cell is removed/covered, wake the cell and its neighbours so
+// flowing fluid can evaporate back toward any remaining sources.
+void NotifyFluidRemoved(int x, int y, int z, BlockId fluidType) {
+	if (fluidType != g_WaterId && fluidType != g_LavaId) return;
+	EnqueueFluidUpdate(x, y, z, fluidType);
+	EnqueueFluidUpdate(x, y + 1, z, fluidType);
+	EnqueueFluidUpdate(x, y - 1, z, fluidType);
+	EnqueueFluidUpdate(x + 1, y, z, fluidType);
+	EnqueueFluidUpdate(x - 1, y, z, fluidType);
+	EnqueueFluidUpdate(x, y, z + 1, fluidType);
+	EnqueueFluidUpdate(x, y, z - 1, fluidType);
+}
+
+// Pick floor/wall torch variant from the face that was clicked.
+// outState receives facing for wall variants. Returns INVALID_BLOCK_ID if the face is invalid (bottom).
+static BlockId ResolveTorchPlacement(BlockId selected, int nx, int ny, int nz,
+	std::map<std::string, std::string>& outState)
+{
+	outState.clear();
+	if (selected == INVALID_BLOCK_ID || selected >= g_blocks.Count()) return selected;
+	const std::string& name = g_blocks.Get(selected).name;
+	if (name.find("torch") == std::string::npos) return selected;
+
+	const bool soul = name.find("soul") != std::string::npos;
+	const bool redstone = name.find("redstone") != std::string::npos;
+
+	auto resolveName = [&](const char* floorName, const char* wallName) -> BlockId {
+		if (ny < 0) return INVALID_BLOCK_ID; // cannot attach to bottom face
+		if (ny > 0) return g_blocks.Resolve(floorName);
+		BlockId wall = g_blocks.Resolve(wallName);
+		// facing points away from the support wall (== placement normal)
+		if (nz < 0) outState["facing"] = "north";
+		else if (nz > 0) outState["facing"] = "south";
+		else if (nx > 0) outState["facing"] = "east";
+		else if (nx < 0) outState["facing"] = "west";
+		return wall;
+		};
+
+	if (soul) return resolveName("soul_torch", "soul_wall_torch");
+	if (redstone) return resolveName("redstone_torch", "redstone_wall_torch");
+	return resolveName("torch", "wall_torch");
+}
+
 int GetFluidLevel(const std::unordered_map<int64_t, Chunk>& chunks, int x, int y, int z, BlockId fluidType) {
 	int cx = (int)floorf((float)x / CHUNK_SIZE), cz = (int)floorf((float)z / CHUNK_SIZE);
 	int lx = x - cx * CHUNK_SIZE, lz = z - cz * CHUNK_SIZE;
@@ -2575,6 +3338,70 @@ int GetFluidLevel(const std::unordered_map<int64_t, Chunk>& chunks, int x, int y
 	auto fit = it->second.fluidLevels.find(Chunk::LightIndex(lx, y, lz));
 	if (fit == it->second.fluidLevels.end()) return MaxFluidLevel(fluidType); // неявный бесконечный источник
 	return fit->second & 0x0F;
+}
+
+// True when the fluid cell has no explicit level entry (worldgen / player source).
+static bool IsFluidSourceAt(const std::unordered_map<int64_t, Chunk>& chunks, int x, int y, int z, BlockId fluidType) {
+	int cx = (int)floorf((float)x / CHUNK_SIZE), cz = (int)floorf((float)z / CHUNK_SIZE);
+	int lx = x - cx * CHUNK_SIZE, lz = z - cz * CHUNK_SIZE;
+	auto it = chunks.find(ChunkKey(cx, cz));
+	if (it == chunks.end()) return false;
+	if (it->second.Get(lx, y, lz) != fluidType) return false;
+	return it->second.fluidLevels.find(Chunk::LightIndex(lx, y, lz)) == it->second.fluidLevels.end();
+}
+
+// Vanilla-like water ↔ lava mixing. Called while holding g_chunksMutex.
+// - water touches lava source  → obsidian (replaces lava)
+// - water touches flowing lava → cobblestone (replaces lava)
+// - lava  touches water source → stone (replaces water)
+// - lava  touches flowing water→ cobblestone (replaces water)
+static void TryFluidMixing(std::unordered_map<int64_t, Chunk>& chunks, int x, int y, int z, BlockId selfType)
+{
+	if (selfType != g_WaterId && selfType != g_LavaId) return;
+	static const int d6[6][3] = {
+		{ 0,-1,0 }, { 0,1,0 }, { -1,0,0 }, { 1,0,0 }, { 0,0,-1 }, { 0,0,1 }
+	};
+
+	for (const auto& d : d6) {
+		const int nx = x + d[0], ny = y + d[1], nz = z + d[2];
+		if (ny < 0 || ny >= WORLD_HEIGHT) continue;
+		int ncx = (int)floorf((float)nx / CHUNK_SIZE);
+		int ncz = (int)floorf((float)nz / CHUNK_SIZE);
+		int nlx = nx - ncx * CHUNK_SIZE;
+		int nlz = nz - ncz * CHUNK_SIZE;
+		auto nit = chunks.find(ChunkKey(ncx, ncz));
+		if (nit == chunks.end()) continue;
+		BlockId neighbor = nit->second.Get(nlx, ny, nlz);
+
+		BlockId result = INVALID_BLOCK_ID;
+		int tx = nx, ty = ny, tz = nz; // cell to convert
+		BlockId convertedFluid = INVALID_BLOCK_ID;
+
+		if (selfType == g_WaterId && neighbor == g_LavaId) {
+			// water → converts the lava cell
+			convertedFluid = g_LavaId;
+			result = IsFluidSourceAt(chunks, nx, ny, nz, g_LavaId) ? g_known.obsidian : g_known.cobblestone;
+		}
+		else if (selfType == g_LavaId && neighbor == g_WaterId) {
+			// lava → converts the water cell
+			convertedFluid = g_WaterId;
+			result = IsFluidSourceAt(chunks, nx, ny, nz, g_WaterId) ? g_known.stone : g_known.cobblestone;
+		}
+
+		if (result == INVALID_BLOCK_ID || result >= g_blocks.Count()) continue;
+
+		// Replace neighbour fluid with solid product
+		auto cit = chunks.find(ChunkKey(
+			(int)floorf((float)tx / CHUNK_SIZE),
+			(int)floorf((float)tz / CHUNK_SIZE)));
+		if (cit == chunks.end()) continue;
+		int clx = tx - cit->second.chunkX * CHUNK_SIZE;
+		int clz = tz - cit->second.chunkZ * CHUNK_SIZE;
+		cit->second.Set(clx, ty, clz, result);
+		DirtyChunksAroundBlock(chunks, tx, ty, tz, 14, true);
+		NotifyFluidRemoved(tx, ty, tz, convertedFluid);
+		RemoveUnsupportedBlocks(chunks, tx, ty, tz);
+	}
 }
 
 void ProcessFluidCell(std::unordered_map<int64_t, Chunk>& chunks, int x, int y, int z, BlockId fluidType) {
@@ -2603,12 +3430,17 @@ void ProcessFluidCell(std::unordered_map<int64_t, Chunk>& chunks, int x, int y, 
 	int maxLevel = MaxFluidLevel(fluidType);
 	int computedLevel = fedFromAbove ? maxLevel : (bestNeighborLevel - 1);
 
-	// воздух ИЛИ заменимый блок (цветы, трава, факелы и т.п.)
+	// Air or plant/torch-like blocks are replaced by flowing fluid
 	if (current == g_AirId || IsReplaceableByFluid(current)) {
 		if (computedLevel <= 0) return;
+		// About to flow into this cell — if opposite fluid is adjacent, mix instead of filling
 		chunk.Set(lx, y, lz, fluidType);
-		chunk.fluidLevels[Chunk::LightIndex(lx, y, lz)] = (uint8_t)(computedLevel & 0x0F) | (fedFromAbove ? 0x10 : 0);
+		chunk.fluidLevels[Chunk::LightIndex(lx, y, lz)] =
+			(uint8_t)(computedLevel & 0x0F) | (fedFromAbove ? 0x10 : 0);
 		DirtyChunksAroundBlock(chunks, x, y, z, 2, true);
+		TryFluidMixing(chunks, x, y, z, fluidType);
+		// Cell may have been converted by mixing on a neighbour; re-read
+		if (chunk.Get(lx, y, lz) != fluidType) return;
 		EnqueueFluidUpdate(x, y - 1, z, fluidType);
 		for (int i = 0; i < 4; i++) EnqueueFluidUpdate(x + ddx[i], y, z + ddz[i], fluidType);
 		return;
@@ -2616,13 +3448,18 @@ void ProcessFluidCell(std::unordered_map<int64_t, Chunk>& chunks, int x, int y, 
 
 	if (current != fluidType) return;
 
+	// Existing fluid cell: check contact with the opposite fluid
+	TryFluidMixing(chunks, x, y, z, fluidType);
+	if (chunk.Get(lx, y, lz) != fluidType) return;
+
 	auto flIt = chunk.fluidLevels.find(Chunk::LightIndex(lx, y, lz));
 	bool hasExplicit = (flIt != chunk.fluidLevels.end());
 
+	// Flowing fluid lost its supply — evaporate (reverse spread).
+	// Set() already clears fluidLevels for fluid→air; do NOT erase flIt after Set
+	// (iterator would be invalidated → crash).
 	if (hasExplicit && computedLevel <= 0 && !fedFromAbove) {
-		// жидкость потеряла питание — испаряется
 		chunk.Set(lx, y, lz, g_AirId);
-		chunk.fluidLevels.erase(flIt);
 		DirtyChunksAroundBlock(chunks, x, y, z, 2, true);
 		EnqueueFluidUpdate(x, y + 1, z, fluidType);
 		EnqueueFluidUpdate(x, y - 1, z, fluidType);
@@ -2635,54 +3472,72 @@ void ProcessFluidCell(std::unordered_map<int64_t, Chunk>& chunks, int x, int y, 
 		if (flIt->second != newPacked) {
 			flIt->second = newPacked;
 			DirtyChunksAroundBlock(chunks, x, y, z, 2, true);
+			// Level changed (e.g. source covered) — wake neighbours so the stream
+			// rebalances / evaporates gradually from the cut toward the tips.
+			EnqueueFluidUpdate(x, y + 1, z, fluidType);
+			EnqueueFluidUpdate(x, y - 1, z, fluidType);
+			for (int i = 0; i < 4; i++)
+				EnqueueFluidUpdate(x + ddx[i], y, z + ddz[i], fluidType);
 		}
 	}
 
 	int effectiveLevel = hasExplicit ? (fedFromAbove ? maxLevel : computedLevel) : maxLevel;
 
 	BlockId below = GetWorldBlock(chunks, cx, cz, lx, y - 1, lz);
-	if (below == g_AirId) {
+	if (below == g_AirId || IsReplaceableByFluid(below)) {
 		EnqueueFluidUpdate(x, y - 1, z, fluidType);
 	}
 	else if (effectiveLevel > 1) {
 		for (int i = 0; i < 4; i++) {
 			BlockId n = GetWorldBlock(chunks, cx, cz, lx + ddx[i], y, lz + ddz[i]);
-			if (n == g_AirId) EnqueueFluidUpdate(x + ddx[i], y, z + ddz[i], fluidType);
+			if (n == g_AirId || IsReplaceableByFluid(n))
+				EnqueueFluidUpdate(x + ddx[i], y, z + ddz[i], fluidType);
+			// Also wake existing fluid neighbours so drying can propagate through the stream
+			else if (n == fluidType)
+				EnqueueFluidUpdate(x + ddx[i], y, z + ddz[i], fluidType);
 		}
 	}
 }
 
+
 void UpdateFluids(std::unordered_map<int64_t, Chunk>& chunks, float dt, float& waterAccum, float& lavaAccum) {
 	constexpr float kWaterTick = 0.20f;
-	constexpr float kLavaTick = 0.60f; // лава обновляется реже/медленнее воды, как просили
-	constexpr int kMaxPerTick = 1500;
+	constexpr float kLavaTick = 0.60f;
+	// Cap work so fluid sim cannot starve chunk streaming / meshing under load.
+	constexpr int kMaxPerTick = 512;
+	constexpr double kBudgetSec = 0.0015; // ~1.5 ms hard ceiling per fluid type
 
 	waterAccum += dt;
 	lavaAccum += dt;
 
+	auto drainQueue = [&](std::queue<FluidPos>& q,
+		std::unordered_set<FluidPos, FluidPosHash, FluidPosEq>& queuedSet,
+		BlockId fluidType)
+		{
+			std::unique_lock<std::shared_mutex> lock(g_chunksMutex);
+			const double t0 = GetTime();
+			int processed = 0;
+			while (processed < kMaxPerTick && (GetTime() - t0) < kBudgetSec) {
+				FluidPos p;
+				{
+					std::lock_guard<std::mutex> qlock(g_fluidMutex);
+					if (q.empty()) break;
+					p = q.front();
+					q.pop();
+					queuedSet.erase(p);
+				}
+				ProcessFluidCell(chunks, p.x, p.y, p.z, fluidType);
+				++processed;
+			}
+		};
+
 	if (waterAccum >= kWaterTick) {
 		waterAccum = 0.0f;
-		std::unique_lock<std::shared_mutex> lock(g_chunksMutex);
-		std::vector<FluidPos> batch;
-		{
-			std::lock_guard<std::mutex> qlock(g_fluidMutex);
-			int n = (std::min)((int)g_waterQueue.size(), kMaxPerTick);
-			batch.reserve(n);
-			for (int i = 0; i < n; i++) { batch.push_back(g_waterQueue.front()); g_waterQueue.pop(); g_waterQueuedSet.erase(batch.back()); }
-		}
-		for (auto& p : batch) ProcessFluidCell(chunks, p.x, p.y, p.z, g_WaterId);
+		drainQueue(g_waterQueue, g_waterQueuedSet, g_WaterId);
 	}
 	if (lavaAccum >= kLavaTick) {
 		lavaAccum = 0.0f;
-		std::unique_lock<std::shared_mutex> lock(g_chunksMutex);
-		std::vector<FluidPos> batch;
-		{
-			std::lock_guard<std::mutex> qlock(g_fluidMutex);
-			int n = (std::min)((int)g_lavaQueue.size(), kMaxPerTick);
-			batch.reserve(n);
-			for (int i = 0; i < n; i++) { batch.push_back(g_lavaQueue.front()); g_lavaQueue.pop(); g_lavaQueuedSet.erase(batch.back()); }
-		}
-		for (auto& p : batch) ProcessFluidCell(chunks, p.x, p.y, p.z, g_LavaId);
+		drainQueue(g_lavaQueue, g_lavaQueuedSet, g_LavaId);
 	}
 }
 
@@ -2714,9 +3569,9 @@ void UpdateChunkStreaming(std::unordered_map<int64_t, Chunk>& chunks,
 			for (int64_t key : toRemove) states[key] = ChunkState::Unloaded;
 		}
 
-		if (timeLeft() > 0.001f) {
-			// Snapshot which chunk keys already exist so we don't touch chunks
-			// under queueMutex without the chunks lock.
+		// Always rebuild the generation queue on rescan (especially world-type switch).
+		// Do not gate this on timeLeft — otherwise an empty world can stay empty.
+		{
 			std::unordered_set<int64_t> existing;
 			{
 				std::shared_lock<std::shared_mutex> chunksLock(g_chunksMutex);
@@ -2757,9 +3612,15 @@ void UpdateChunkStreaming(std::unordered_map<int64_t, Chunk>& chunks,
 		}
 
 		if (!ready.empty()) {
+			const int curEpoch = g_worldGenEpoch.load(std::memory_order_relaxed);
 			std::unique_lock<std::shared_mutex> chunksLock(g_chunksMutex);
 			for (auto& res : ready) {
 				if (timeLeft() < 0.0003f) break;
+				// Stale result from previous world type — ignore
+				if (res.epoch != curEpoch) {
+					states[res.key] = ChunkState::Unloaded;
+					continue;
+				}
 				int cx = res.chunk.chunkX, cz = res.chunk.chunkZ;
 				if (abs(cx - playerChunkX) > g_renderDistance || abs(cz - playerChunkZ) > g_renderDistance) {
 					states[res.key] = ChunkState::Unloaded;
@@ -3262,6 +4123,8 @@ size_t EstimateModelVRAM(const Model& model) {
 int main() {
 	InitWindow(1920, 1040, "Sandbox 3D");
 	SetTargetFPS(0);
+	bool vsyncEnabled = false;
+	ClearWindowState(FLAG_VSYNC_HINT);
 
 	rlImGuiSetup(true);
 
@@ -3293,7 +4156,9 @@ int main() {
 	int selectedBlockIndex = 0;
 
 	int worldSeed = GenerateRandomSeed();
-	std::cout << "World seed: " << worldSeed << std::endl;
+	// g_worldType: 0 = normal, 1 = flat (set before first chunk gen; changeable in Debug UI)
+	std::cout << "World seed: " << worldSeed
+		<< "  type: " << (g_worldType == 1 ? "flat" : "normal") << std::endl;
 
 	g_worldSeed = worldSeed;
 	InitTerrainNoise(worldSeed);
@@ -3302,6 +4167,9 @@ int main() {
 	std::unordered_map<int64_t, Chunk> worldChunks;
 	std::map<std::string, Texture2D> textureCache;
 
+	// 1) Explicit gameplay registration (stable ids, logic contract)
+	g_blocks.RegisterGameplayBlocks();
+	// 2) Load appearance from blockstates/models; textures only as assets
 	g_blocks.LoadAll("resources/blockstates", textureCache);
 	ConfigureBlockSupportTypes();
 	ResolveKnownBlockIds();
@@ -3312,6 +4180,9 @@ int main() {
 
 	g_lavaTexture = GetOrLoadTexture(textureCache, "minecraft:block/lava_still");
 	SetTextureFilter(g_lavaTexture, TEXTURE_FILTER_POINT);
+
+	// 3) Pack all loaded PNGs into atlas pages (no art replacement; lighting unchanged)
+	g_atlas.BuildFromCache(textureCache);
 
 	g_worldChunksPtr = &worldChunks;
 
@@ -3379,71 +4250,158 @@ int main() {
 
 		bool playerChunkChanged = (playerChunkX != lastPlayerChunkX || playerChunkZ != lastPlayerChunkZ);
 		bool distanceChanged = (g_renderDistance != lastStreamRenderDistance);
-		bool rescanNeeded = playerChunkChanged || distanceChanged;
+		bool rescanNeeded = playerChunkChanged || distanceChanged || g_forceWorldRescan;
+		if (g_forceWorldRescan) g_forceWorldRescan = false;
 
 		UpdateChunkStreaming(worldChunks, chunkStates, playerChunkX, playerChunkZ, rescanNeeded, freeTime);
 		UpdateFluids(worldChunks, deltaTime, waterTickAccum, lavaTickAccum);
 
 		Vector3 lookDirection = Vector3Normalize(Vector3Subtract(camera.target, camera.position));
+		// Outline target: always fresh raycast (no fluid)
 		BlockHit targetedBlock = RaycastBlock(worldChunks, camera.position, lookDirection, 8.0f);
-		if (mouseLocked && IsMouseButtonPressed(MOUSE_BUTTON_LEFT) && targetedBlock.hit
-			&& targetedBlock.type != g_BedrockId)
-		{
-			int cx = (int)floorf((float)targetedBlock.x / CHUNK_SIZE);
-			int cz = (int)floorf((float)targetedBlock.z / CHUNK_SIZE);
-			int lx = targetedBlock.x - cx * CHUNK_SIZE;
-			int lz = targetedBlock.z - cz * CHUNK_SIZE;
 
-			{
+		// Hold LMB/RMB: continuous break/place with cooldown (~4–5 actions/sec).
+		// Target is re-raycast every action tick so mouse movement updates the cell.
+		// Disabled in spectator (gameMode == 2) and when cursor is unlocked.
+		static float breakCooldown = 0.0f;
+		static float placeCooldown = 0.0f;
+		static int lastInputGameMode = -1;
+		constexpr float kBreakInterval = 0.22f;
+		constexpr float kPlaceInterval = 0.22f;
+		if (gameMode != lastInputGameMode) {
+			breakCooldown = 0.0f;
+			placeCooldown = 0.0f;
+			lastInputGameMode = gameMode;
+		}
+		breakCooldown = std::max(0.0f, breakCooldown - deltaTime);
+		placeCooldown = std::max(0.0f, placeCooldown - deltaTime);
+
+		const bool canBuildDestroy = mouseLocked && gameMode != 2;
+
+		if (canBuildDestroy && IsMouseButtonDown(MOUSE_BUTTON_LEFT) && breakCooldown <= 0.0f)
+		{
+			BlockHit hit = RaycastBlock(worldChunks, camera.position, lookDirection, 8.0f);
+			if (hit.hit && hit.type != g_BedrockId) {
+				int cx = (int)floorf((float)hit.x / CHUNK_SIZE);
+				int cz = (int)floorf((float)hit.z / CHUNK_SIZE);
+				int lx = hit.x - cx * CHUNK_SIZE;
+				int lz = hit.z - cz * CHUNK_SIZE;
 				std::unique_lock<std::shared_mutex> lock(g_chunksMutex);
 				auto chunkIt = worldChunks.find(ChunkKey(cx, cz));
 				if (chunkIt != worldChunks.end()) {
-					// Removing any block (especially a torch or an opaque block)
-					// can change light propagation. Mark a full light-radius
-					// of chunks dirty so their baked vertex lighting is rebuilt.
-					chunkIt->second.Set(lx, targetedBlock.y, lz, g_AirId);
-					DirtyChunksAroundBlock(worldChunks, targetedBlock.x, targetedBlock.y, targetedBlock.z);
-					RemoveUnsupportedBlocks(worldChunks, targetedBlock.x, targetedBlock.y, targetedBlock.z);
-					EnqueueFluidUpdate(targetedBlock.x, targetedBlock.y, targetedBlock.z, g_WaterId);
-					EnqueueFluidUpdate(targetedBlock.x, targetedBlock.y, targetedBlock.z, g_LavaId);
+					chunkIt->second.Set(lx, hit.y, lz, g_AirId);
+					DirtyChunksAroundBlock(worldChunks, hit.x, hit.y, hit.z);
+					RemoveUnsupportedBlocks(worldChunks, hit.x, hit.y, hit.z);
+					EnqueueFluidUpdate(hit.x, hit.y, hit.z, g_WaterId);
+					EnqueueFluidUpdate(hit.x, hit.y, hit.z, g_LavaId);
+					breakCooldown = kBreakInterval;
 					targetedBlock.hit = false;
 				}
 			}
 		}
 
-		if (mouseLocked && IsMouseButtonPressed(MOUSE_BUTTON_RIGHT) && targetedBlock.hit
-			&& targetedBlock.type != g_known.torch && !IsCross(targetedBlock.type)) {
-			int px = targetedBlock.x + targetedBlock.nx;
-			int py = targetedBlock.y + targetedBlock.ny;
-			int pz = targetedBlock.z + targetedBlock.nz;
-			int pcx = (int)floorf((float)px / CHUNK_SIZE);
-			int pcz = (int)floorf((float)pz / CHUNK_SIZE);
-			int plx = px - pcx * CHUNK_SIZE;
-			int plz = pz - pcz * CHUNK_SIZE;
-			if (py >= 0 && py < WORLD_HEIGHT && !g_placeableBlocks.empty()) {
-				std::unique_lock<std::shared_mutex> lock(g_chunksMutex);
-				auto placeChunk = worldChunks.find(ChunkKey(pcx, pcz));
-				BlockId at = GetWorldBlock(worldChunks, pcx, pcz, plx, py, plz);
-				if (placeChunk != worldChunks.end() && (at == g_AirId || IsCross(at))) {
-					const float playerRadius = 0.25f;
-					const float playerFeetY = camera.position.y - eyeHeight;
-					const float playerHeight = 1.8f;
-					const bool overlapsPlayer =
-						camera.position.x + playerRadius > (float)px &&
-						camera.position.x - playerRadius < (float)px + 1.0f &&
-						playerFeetY + playerHeight > (float)py &&
-						playerFeetY < (float)py + 1.0f &&
-						camera.position.z + playerRadius > (float)pz &&
-						camera.position.z - playerRadius < (float)pz + 1.0f;
-					if (!overlapsPlayer) {
-						BlockId toPlace = g_placeableBlocks[selectedBlockIndex];
-						if (GetSupportType(toPlace) == SupportType::None ||
-							BlockHasRequiredSupport(worldChunks, px, py, pz, toPlace)) {
-							placeChunk->second.Set(plx, py, plz, toPlace);
-							DirtyChunksAroundBlock(worldChunks, px, py, pz);
-							RemoveUnsupportedBlocks(worldChunks, px, py, pz);
-							if (toPlace == g_WaterId || toPlace == g_LavaId)
-								EnqueueFluidUpdate(px, py, pz, toPlace);
+		// Middle mouse: pick targeted block as the placeable selection (like vanilla pick-block).
+		// Separate raycast includes fluids so water/lava can be selected.
+		if (mouseLocked && IsMouseButtonPressed(MOUSE_BUTTON_MIDDLE) && !g_placeableBlocks.empty())
+		{
+			BlockHit pickHit = RaycastBlock(worldChunks, camera.position, lookDirection, 8.0f, true);
+			if (pickHit.hit && pickHit.type != g_AirId) {
+				BlockId pick = pickHit.type;
+				// Prefer the inventory form for wall variants (wall_torch → torch, etc.)
+				if (pick < g_blocks.Count()) {
+					const std::string& n = g_blocks.Get(pick).name;
+					if (n.find("wall_torch") != std::string::npos) {
+						if (n.find("soul") != std::string::npos) pick = g_blocks.Resolve("soul_torch");
+						else if (n.find("redstone") != std::string::npos) pick = g_blocks.Resolve("redstone_torch");
+						else pick = g_blocks.Resolve("torch");
+					}
+					else if (n.find("wall_") == 0) {
+						std::string base = n.substr(5);
+						BlockId alt = g_blocks.Resolve(base);
+						if (alt != INVALID_BLOCK_ID) pick = alt;
+					}
+				}
+				for (int i = 0; i < (int)g_placeableBlocks.size(); i++) {
+					if (g_placeableBlocks[i] == pick) {
+						selectedBlockIndex = i;
+						break;
+					}
+				}
+			}
+		}
+
+		if (canBuildDestroy && IsMouseButtonDown(MOUSE_BUTTON_RIGHT) && placeCooldown <= 0.0f)
+		{
+			// Fresh raycast each place tick (target can change while holding)
+			BlockHit hit = RaycastBlock(worldChunks, camera.position, lookDirection, 8.0f);
+			if (hit.hit && !IsReplaceableByFluid(hit.type)) {
+				int px = hit.x + hit.nx;
+				int py = hit.y + hit.ny;
+				int pz = hit.z + hit.nz;
+				int pcx = (int)floorf((float)px / CHUNK_SIZE);
+				int pcz = (int)floorf((float)pz / CHUNK_SIZE);
+				int plx = px - pcx * CHUNK_SIZE;
+				int plz = pz - pcz * CHUNK_SIZE;
+				if (py >= 0 && py < WORLD_HEIGHT && !g_placeableBlocks.empty()) {
+					std::unique_lock<std::shared_mutex> lock(g_chunksMutex);
+					auto placeChunk = worldChunks.find(ChunkKey(pcx, pcz));
+					BlockId at = GetWorldBlock(worldChunks, pcx, pcz, plx, py, plz);
+					const bool canReplace = (at == g_AirId || IsCross(at) || IsReplaceableByFluid(at) || IsFluidBlock(at));
+					if (placeChunk != worldChunks.end() && canReplace) {
+						const float playerRadius = 0.25f;
+						const float playerFeetY = camera.position.y - eyeHeight;
+						const float playerHeight = 1.8f;
+						// Prevent building inside / under the player while holding RMB
+						const bool overlapsPlayer =
+							camera.position.x + playerRadius > (float)px &&
+							camera.position.x - playerRadius < (float)px + 1.0f &&
+							playerFeetY + playerHeight >(float)py &&
+							playerFeetY < (float)py + 1.0f &&
+							camera.position.z + playerRadius >(float)pz &&
+							camera.position.z - playerRadius < (float)pz + 1.0f;
+						if (!overlapsPlayer) {
+							BlockId toPlace = g_placeableBlocks[selectedBlockIndex];
+							std::map<std::string, std::string> placeState;
+
+							toPlace = ResolveTorchPlacement(toPlace, hit.nx, hit.ny, hit.nz, placeState);
+							if (toPlace != INVALID_BLOCK_ID && toPlace < g_blocks.Count()) {
+								const SupportType st = GetSupportType(toPlace);
+								bool supported = (st == SupportType::None);
+								if (!supported) {
+									supported = HasSupportOnFace(worldChunks, px, py, pz,
+										-hit.nx, -hit.ny, -hit.nz);
+								}
+								// Gravity blocks may be placed in air and will fall
+								if (!supported && IsGravityBlock(toPlace))
+									supported = true;
+
+								if (supported) {
+									const BlockId replaced = at;
+									placeChunk->second.Set(plx, py, plz, toPlace);
+									if (!placeState.empty())
+										placeChunk->second.SetBlockState(plx, py, plz, placeState);
+
+									if (IsFluidBlock(replaced) && !IsFluidBlock(toPlace))
+										NotifyFluidRemoved(px, py, pz, replaced);
+
+									// Placing fluid on air or on existing partial/full fluid:
+									// no fluidLevels entry → infinite full source, then respread.
+									if (IsFluidBlock(toPlace)) {
+										placeChunk->second.fluidLevels.erase(
+											Chunk::LightIndex(plx, py, plz));
+										EnqueueFluidUpdate(px, py, pz, toPlace);
+										TryFluidMixing(worldChunks, px, py, pz, toPlace);
+									}
+
+									if (IsGravityBlock(toPlace) &&
+										!HasSupportOnFace(worldChunks, px, py, pz, 0, -1, 0))
+										FallGravityBlock(worldChunks, px, py, pz);
+
+									DirtyChunksAroundBlock(worldChunks, px, py, pz);
+									RemoveUnsupportedBlocks(worldChunks, px, py, pz);
+									placeCooldown = kPlaceInterval;
+								}
+							}
 						}
 					}
 				}
@@ -3568,6 +4526,10 @@ int main() {
 		ImGui::Text("FPS: %d", GetFPS());
 		ImGui::Text("Frame time: %.3f ms", GetFrameTime() * 1000.0f);
 		ImGui::Text("Mouse locked: %s", mouseLocked ? "yes" : "no");
+		if (ImGui::Checkbox("VSync", &vsyncEnabled)) {
+			if (vsyncEnabled) SetWindowState(FLAG_VSYNC_HINT);
+			else ClearWindowState(FLAG_VSYNC_HINT);
+		}
 		const char* gameModes[] = { "Survival", "Creative", "Spectator" };
 		if (ImGui::Combo("Game Mode", &gameMode, gameModes, IM_ARRAYSIZE(gameModes))) {
 			verticalVelocity = 0.0f;
@@ -3576,6 +4538,49 @@ int main() {
 			walkVelocity = { 0.0f, 0.0f, 0.0f };
 			creativeFlying = false;
 			lastSpaceTapTime = -10.0f;
+			// break/place cooldowns reset via lastInputGameMode check in the input block
+		}
+		{
+			const char* worldTypes[] = { "Normal", "Flat" };
+			int prevType = g_worldType;
+			if (ImGui::Combo("World Type", &g_worldType, worldTypes, IM_ARRAYSIZE(worldTypes))
+				&& g_worldType != prevType)
+			{
+				// Invalidate all in-flight generation from the previous world type
+				g_worldGenEpoch.fetch_add(1, std::memory_order_relaxed);
+
+				// Full regen: drop loaded world and let streaming rebuild
+				{
+					std::unique_lock<std::shared_mutex> lock(g_chunksMutex);
+					worldChunks.clear();
+				}
+				chunkStates.clear();
+				{
+					std::lock_guard<std::mutex> qlock(queueMutex);
+					while (!generationQueue.empty()) generationQueue.pop();
+					while (!meshQueue.empty()) meshQueue.pop();
+					while (!finishedChunks.empty()) finishedChunks.pop();
+					while (!finishedMeshes.empty()) finishedMeshes.pop();
+					g_meshInFlight.clear();
+					g_inFlight.clear();
+				}
+				{
+					std::lock_guard<std::mutex> flock(g_fluidMutex);
+					while (!g_waterQueue.empty()) g_waterQueue.pop();
+					while (!g_lavaQueue.empty()) g_lavaQueue.pop();
+					g_waterQueuedSet.clear();
+					g_lavaQueuedSet.clear();
+				}
+				if (g_worldType == 1) {
+					camera.position.y = (float)FLAT_SURFACE_Y + eyeHeight + 0.1f;
+					verticalVelocity = 0.0f;
+				}
+				// Force streaming to rebuild gen queue next frame (and don't rely on time budget)
+				g_forceWorldRescan = true;
+				lastPlayerChunkX = INT_MAX;
+				lastPlayerChunkZ = INT_MAX;
+				lastStreamRenderDistance = -1;
+			}
 		}
 		if (gameMode == 1)
 			ImGui::Text("Creative fly: %s ", creativeFlying ? "ON" : "OFF");
